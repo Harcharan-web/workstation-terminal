@@ -1,0 +1,51 @@
+[package]
+name = "sshweb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Single-binary SSH-over-Web gateway for macOS: browser terminal with SSH public-key login"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["ws", "macros"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls", "tls-rustls-no-provider"], default-features = false }
+base64 = "0.23.1"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+futures-util = "0.3.34"
+getrandom = "0.3"
+hex = "0.4.3"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+libc = "0.2.190"
+mime_guess = "2.0.5"
+portable-pty = "0.9.0"
+rust-embed = { version = "8.13.0", features = ["include-exclude"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml_ng = "0.10.0"
+sha2 = "0.11.0"
+ssh-key = { version = "0.6.7", features = ["ed25519", "rsa", "p256", "std", "alloc", "rand_core", "crypto"] }
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["formatting", "macros"] }
+tokio = { version = "1.53.2", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["set-header", "limit"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+
+[dev-dependencies]
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "cookies"] }
+tempfile = "3.27.0"
+tokio-tungstenite = "0.30.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

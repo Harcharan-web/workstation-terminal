@@ -1,0 +1,83 @@
+# sshweb threat model and security design
+
+## What sshweb protects
+
+| Asset | Why it matters |
+|---|---|
+| Shell access to the macOS account running sshweb | Full control of that user's files, keychains (when unlocked), SSH keys and network position. |
+| Access to remote SSH hosts via configured profiles | The gateway holds or reaches identities for those hosts. |
+| The authorisation file and `known_hosts` | They decide who may log in and which servers are genuine. |
+| Login session tokens | Bearer credentials for an authenticated browser. |
+| Terminal contents | May contain passwords, tokens and operational data. |
+
+## Trust boundaries
+
+1. **Browser ↔ gateway** (HTTP/WebSocket). Loopback by default; HTTPS/WSS is mandatory off-loopback.
+2. **Gateway ↔ local OS.** Child processes run as the gateway's unprivileged user. sshweb refuses to run as root.
+3. **Gateway ↔ remote hosts** (OpenSSH). Host identity comes only from the managed `known_hosts`.
+4. **Administrator ↔ gateway** (config files, CLI, admin Unix socket). Filesystem permissions are the boundary.
+
+## Adversaries and mitigations
+
+| # | Threat | Mitigations | Tests |
+|---|---|---|---|
+| T1 | **Unauthenticated network user** gets a shell | No terminal message is processed before authentication. The upgrade is refused for foreign origins. Every terminal op re-validates the login. Default bind is 127.0.0.1. | `unauthenticated_socket_cannot_open_terminal`, `hello_is_required_and_versioned` |
+| T2 | **Key impersonation**: attacker knows a public key | Login needs an SSHSIG over a server-generated message. The server rebuilds the message from its own state, checks namespace `sshweb-auth`, checks the signing key belongs to the claimed user, then verifies (RustCrypto `ssh-key`). A bare public key is rejected. | `a_bare_public_key_is_not_proof`, `signature_from_unauthorised_key_or_other_user_rejected` |
+| T3 | **Replay** of a captured signature | Challenges are single-use (deleted on first attempt, even a failed one) and expire after 120 s by default. Each carries a 256-bit nonce. | `challenge_single_use`, `full_login_flow_and_replay_prevention` |
+| T4 | **Signature theft / login CSRF**: a signature redeemed from another browser | The challenge is bound to a random HttpOnly, SameSite=Strict cookie (or to the WebSocket connection) and verified in constant time. | `challenge_bound_to_requesting_browser`, `challenge_binding` |
+| T5 | **Cross-protocol reuse** (e.g. tricking a user into a git-signing operation) | The namespace must equal `sshweb-auth`. The message format `sshweb-auth-v1 …` is not a valid git or file signature target. | `ssh_keygen_signature_interoperates` |
+| T6 | **Cross-site WebSocket hijacking / CSRF** | The `Origin` must exactly match an allowed origin (scheme, host and port) for the WebSocket upgrade and for every state-changing `/api` request. Cookies are SameSite=Strict. | `rejects_cross_site_websocket`, `state_changing_requests_require_origin` |
+| T7 | **DNS rebinding** against the loopback listener | The `Host` header must be one of the bind addresses or configured origins; otherwise 421. | `rejects_foreign_host_header` |
+| T8 | **Online guessing / brute force** | Challenge issuance is rate-limited per IP. After N failures in a window, the IP and the user are locked out temporarily. Errors are generic. Unknown users still receive challenges (no user enumeration). | `challenge_rate_limit`, `lockout_after_repeated_failures` |
+| T9 | **Token theft** | 256-bit CSPRNG tokens in HttpOnly cookies, stored server-side only as SHA-256. Absolute and idle expiry. Logout, admin revocation and key revocation take effect within seconds. TLS cookies use `Secure` and the `__Host-` prefix. HSTS is sent under TLS. | `tokens_are_not_stored_in_clear`, `logout_and_key_revocation_end_access`, `https_mode_sets_secure_cookies_and_hsts` |
+| T10 | **XSS / UI injection** | Strict CSP (`script-src 'self'`, no inline scripts, `frame-ancestors 'none'`). The UI uses `textContent`, never `innerHTML`, for server data. Terminal output is rendered by xterm.js, not the DOM. | `serves_embedded_frontend_with_security_headers` |
+| T11 | **Resource exhaustion** | Per-message size limit (64 KiB), HTTP body limit, a global WebSocket connection cap, per-connection input token bucket, bounded channels with backpressure end to end, bounded scrollback, session limits total and per user, a cap on outstanding challenges, and protocol-error budgets. | `oversized_message_closes_connection`, `too_many_protocol_errors_close_the_socket`, `session_limit_per_user`, `malformed_and_oversized_requests` |
+| T12 | **Command injection** into the shell or ssh | No shell is ever used to build commands. ssh/ssh-keyscan/ssh-keygen get argv vectors. Hosts and users are allowlist-validated (no leading `-`, restricted charset). `--` precedes the host. Users can pick only shells from `allowed_shells` ∩ `/etc/shells`. Profile ids are lookups only. | `host_and_user_validation`, `ssh_args_are_hardened`, `local_shell_policy`, `disallowed_shell_and_local_access_refused` |
+| T13 | **Open proxy / pivoting** | Remote targets must be configured profiles the user is authorised for. Ad-hoc targets are off by default and, when enabled, constrained by host, port and user allowlists plus `remote:*`. Port, agent and X11 forwarding, ProxyCommand/ProxyJump, LocalCommand, ControlMaster and the escape char are disabled. | `profile_authorisation`, `adhoc_requires_allowlists`, `auth_failure_and_unauthorised_profiles` |
+| T14 | **Man-in-the-middle on remote SSH** | `StrictHostKeyChecking=yes` with only the managed `known_hosts` (`GlobalKnownHostsFile=/dev/null`, `UpdateHostKeys=no`, `-F none`). Unknown or changed keys fail. Keys are added only by an admin, after fingerprint confirmation or from an out-of-band key file. | `unknown_host_key_is_rejected`, `changed_host_key_is_rejected` |
+| T15 | **Session hijack between users** | Sessions are bound to their owner. Detached sessions can only be re-attached by the same user after a fresh key login, and are tied to the owning key's fingerprint, so key revocation ends them even when no login exists. Attaching or closing another user's session returns the same "not found" error as a nonexistent id. Each socket is bound to at most one session. | `sessions_are_bound_to_their_owner` |
+| T16 | **Privilege escalation via files** | Refuses to start if `authorized_keys`, `known_hosts` or config are group/world-writable or owned by another user. TLS keys and identity files must be 0600. State dir 0700, admin socket 0600, audit log 0600. | `admin_file_permissions`, `private_file_permissions`, `validate_reports_unsafe_settings` |
+| T17 | **Self-authorisation**: a gateway user adds their own key | The server has no endpoint that writes `authorized_keys`. Keys can only be added by someone who can write the file (the admin account). | by construction |
+| T18 | **Sensitive data in logs** | Terminal I/O is never logged. Signatures, tokens and challenge nonces aren't written to the audit log. Audit fields are length-limited and stripped of control characters (no log forging). | `full_login_flow_and_replay_prevention`, `writes_json_lines_and_sanitizes` |
+| T19 | **Orphaned processes** | Each session's child is a session leader. On close the whole process group gets SIGHUP, then SIGKILL after a grace period. Graceful shutdown closes every session. | `terminate_kills_process_group`, `graceful_shutdown_closes_sessions_and_sockets` |
+| T20 | **Accidental exposure** | A non-loopback bind needs `allow_remote_access: true` **and** TLS. A wildcard bind needs explicit `allowed_origins`. Metrics are off on the HTTP port by default and loopback-only when enabled. Admin functions exist only on the private Unix socket. | `remote_exposure_requires_opt_in_tls_and_origins`, `serve_refuses_unsafe_remote_exposure` |
+
+## Residual risks and limitations
+
+- **Relay phishing.** The copy-paste flow can't bind the signature to the browser's real origin the
+  way WebAuthn can. A malicious page could fetch a real challenge and ask the victim to sign it. Mitigations:
+  the origin is inside the signed message, so users should check it (`sshweb sign` prints it). Challenges
+  expire in 120 s. Keep the gateway on loopback or a VPN. A browser extension or native helper could
+  enforce origin binding in future.
+- **Shared OS account.** All gateway identities get shells as the one macOS user that runs sshweb.
+  Separating users needs separate instances under separate accounts.
+- **Terminal = full trust.** Anything the user can do in Terminal.app, they can do here. Programs in
+  the session can read data in that account.
+- **Passphrases through the gateway.** If a remote profile uses an encrypted identity file without an
+  agent, the passphrase is typed in the browser and passes through gateway memory (never logged).
+- **Unattended shells.** Detached shells keep running for up to `sessions.detach_grace_secs` (default
+  30 min) after the browser goes away. They can't be reached without a fresh key login, but they keep
+  running programs and holding resources. Lower the setting if that matters.
+- **In-memory state.** Logins, lockouts and challenges don't survive restarts. A restart logs everyone
+  out (fail safe) but also clears lockouts.
+- **Fail-closed authorisation file.** One malformed line rejects all logins and terminates existing
+  sessions until fixed. This is deliberate, but it means an editing mistake causes an outage.
+  Use `sshweb keys add/revoke` and `sshweb config validate`.
+- **Lockout as DoS.** An attacker can lock out a user name by sending bad signatures for it.
+  Lockouts are temporary (`rate_limit.lockout_secs`).
+- **Trust in dependencies.** RustCrypto `ssh-key` (signature verification), `rustls` (TLS),
+  OpenSSH (remote transport, host keys), `portable-pty` and xterm.js.
+- **No external audit yet.**
+
+## Operational guidance
+
+- Keep `bind: 127.0.0.1` unless you need network access. If you do, prefer binding to a VPN interface
+  (e.g. a Tailscale address) over `0.0.0.0`, and use a real certificate.
+- Use Ed25519 keys. For remote profiles, use dedicated keys with `restrict`/`from=` options on the
+  remote side where possible, and prefer ssh-agent over encrypted identity files.
+- Review `audit.log` regularly: `auth_failure`, `auth_lockout`, `ws_rejected`, `session_denied`.
+- Revoke promptly with `sshweb keys revoke` and `sshweb sessions revoke`.
+
+## Reporting vulnerabilities
+
+See [../SECURITY.md](../SECURITY.md).
