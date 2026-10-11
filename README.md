@@ -296,7 +296,8 @@ If browsers reach sshweb through a proxy (e.g. `https://dev.example.net` → `ht
 - Add the proxy's public origin to `server.allowed_origins` (e.g. `"https://dev.example.net"`). Otherwise
   logins and other API calls fail with *cross-origin request rejected*, and WebSockets get 403.
 - Add the proxy's IP to `server.trusted_proxies`, so rate limits, lockouts and the audit log use the real client
-  IP from `X-Forwarded-For`. The header is ignored from any other peer.
+  IP from `X-Forwarded-For` (or `X-Real-IP` when the proxy sends no `X-Forwarded-For`). Both headers are
+  ignored from any other peer.
 - The proxy must: pass `Origin` and `Cookie` through **unchanged** (never rewrite `Origin`, which would disable
   CSRF and WebSocket-hijacking protection); support WebSocket upgrades on `/ws`; set `X-Forwarded-For`;
   use long read timeouts (hours) and no response buffering for `/ws`; and pass `Set-Cookie` through unchanged.

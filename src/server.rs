@@ -111,11 +111,21 @@ pub fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 
 /// The client IP used for rate limiting, lockouts and auditing. `X-Forwarded-For` is honoured
 /// only when the TCP peer is a configured trusted proxy; the right-most address that is not
-/// itself a trusted proxy is used. Anything unparsable falls back to the peer address.
+/// itself a trusted proxy is used. A trusted proxy that sends no `X-Forwarded-For` may report
+/// the client in `X-Real-IP` instead (single value, nginx `$remote_addr`). Anything unparsable
+/// falls back to the peer address.
 pub fn client_ip(cfg: &Config, peer: SocketAddr, headers: &HeaderMap) -> std::net::IpAddr {
     let trusted = &cfg.server.trusted_proxies;
     if !trusted.contains(&peer.ip()) {
         return peer.ip();
+    }
+    if !headers.contains_key("x-forwarded-for") {
+        return headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+            .filter(|ip| !trusted.contains(ip))
+            .unwrap_or(peer.ip());
     }
     let mut chain = Vec::new();
     for v in headers.get_all("x-forwarded-for") {
@@ -895,5 +905,41 @@ mod tests {
         // Garbage or absent header: fall back to the peer.
         assert_eq!(client_ip(&cfg, proxy, &h(&["not-an-ip"])), proxy.ip());
         assert_eq!(client_ip(&cfg, proxy, &h(&[])), proxy.ip());
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_x_real_ip_from_trusted_proxies() {
+        let real = |v: &str| {
+            let mut m = HeaderMap::new();
+            m.insert("x-real-ip", v.parse().unwrap());
+            m
+        };
+        let mut cfg = Config::default();
+        let proxy: SocketAddr = "172.16.0.99:5000".parse().unwrap();
+        let other: SocketAddr = "172.16.0.50:5000".parse().unwrap();
+        // No trusted proxies: header ignored.
+        assert_eq!(client_ip(&cfg, proxy, &real("10.0.0.7")), proxy.ip());
+        cfg.server.trusted_proxies = vec!["172.16.0.99".parse().unwrap()];
+        assert_eq!(
+            client_ip(&cfg, proxy, &real(" 10.0.0.7 ")).to_string(),
+            "10.0.0.7"
+        );
+        assert_eq!(
+            client_ip(&cfg, proxy, &real("2001:db8::7")).to_string(),
+            "2001:db8::7"
+        );
+        // Untrusted peers cannot spoof.
+        assert_eq!(client_ip(&cfg, other, &real("10.0.0.7")), other.ip());
+        // Garbage, a list, or the proxy itself: fall back to the peer.
+        assert_eq!(client_ip(&cfg, proxy, &real("not-an-ip")), proxy.ip());
+        assert_eq!(
+            client_ip(&cfg, proxy, &real("10.0.0.7, 10.0.0.8")),
+            proxy.ip()
+        );
+        assert_eq!(client_ip(&cfg, proxy, &real("172.16.0.99")), proxy.ip());
+        // X-Forwarded-For wins when both are present.
+        let mut both = h(&["10.0.0.8"]);
+        both.insert("x-real-ip", "10.0.0.7".parse().unwrap());
+        assert_eq!(client_ip(&cfg, proxy, &both).to_string(), "10.0.0.8");
     }
 }
