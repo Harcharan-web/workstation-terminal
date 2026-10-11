@@ -1,0 +1,283 @@
+//! Authentication and authorisation service.
+
+pub mod challenge;
+pub mod keys;
+pub mod sessions;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::audit::{Audit, AuditEvent};
+use crate::config::Config;
+use crate::metrics::Metrics;
+use crate::security::rate_limit::{FailureTracker, RateLimiter};
+use challenge::{Challenge, ChallengeError, ChallengeStore, VerifyError};
+use keys::KeyStore;
+use sessions::{Login, LoginState, LoginStore};
+
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    #[error("too many requests; try again later")]
+    RateLimited,
+    #[error("temporarily locked out after repeated failures; try again in {0} seconds")]
+    LockedOut(u64),
+    #[error("invalid user name")]
+    InvalidUser,
+    #[error("authentication failed")]
+    Challenge(#[from] ChallengeError),
+    #[error("authentication failed")]
+    Verify(#[from] VerifyError),
+    #[error("authentication is unavailable: the authorized keys file is missing or invalid")]
+    KeysUnavailable,
+}
+
+impl AuthError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            AuthError::RateLimited => "rate_limited",
+            AuthError::LockedOut(_) => "locked_out",
+            AuthError::InvalidUser => "invalid_user",
+            AuthError::Challenge(_) | AuthError::Verify(_) => "auth_failed",
+            AuthError::KeysUnavailable => "auth_unavailable",
+        }
+    }
+}
+
+pub struct AuthService {
+    pub keys: KeyStore,
+    pub challenges: ChallengeStore,
+    pub logins: LoginStore,
+    challenge_rl: RateLimiter,
+    failures: FailureTracker,
+    audit: Arc<Audit>,
+    metrics: Arc<Metrics>,
+}
+
+impl AuthService {
+    pub fn new(cfg: &Config, audit: Arc<Audit>, metrics: Arc<Metrics>) -> Self {
+        let rl = &cfg.rate_limit;
+        Self {
+            keys: KeyStore::new(cfg.auth.authorized_keys.clone(), cfg.auth.min_rsa_bits),
+            challenges: ChallengeStore::new(Duration::from_secs(cfg.auth.challenge_ttl_secs)),
+            logins: LoginStore::new(
+                Duration::from_secs(cfg.auth.session_ttl_secs),
+                Duration::from_secs(cfg.auth.session_idle_timeout_secs),
+            ),
+            challenge_rl: RateLimiter::new(rl.challenges_per_minute, Duration::from_secs(60)),
+            failures: FailureTracker::new(
+                rl.max_failures,
+                Duration::from_secs(rl.failure_window_secs),
+                Duration::from_secs(rl.lockout_secs),
+            ),
+            audit,
+            metrics,
+        }
+    }
+
+    fn check_lockout(&self, ip: &str, user: Option<&str>) -> Result<(), AuthError> {
+        let mut keys = vec![format!("ip:{ip}")];
+        if let Some(u) = user {
+            keys.push(format!("user:{u}"));
+        }
+        for k in keys {
+            if let Some(rem) = self.failures.locked(&k) {
+                return Err(AuthError::LockedOut(rem.as_secs().max(1)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Issue a challenge. Unknown users get a challenge too, so user names cannot be probed.
+    pub fn issue_challenge(
+        &self,
+        user: &str,
+        origin: &str,
+        binding: &str,
+        ip: &str,
+    ) -> Result<Challenge, AuthError> {
+        if !keys::valid_user(user) {
+            return Err(AuthError::InvalidUser);
+        }
+        if !self.challenge_rl.check(&format!("ip:{ip}")) {
+            self.audit
+                .log(AuditEvent::new("auth_rate_limited").ip(ip).user(user));
+            return Err(AuthError::RateLimited);
+        }
+        self.check_lockout(ip, Some(user))?;
+        let ch = self.challenges.issue(user, origin, binding).map_err(|e| {
+            if e == ChallengeError::Capacity {
+                AuthError::RateLimited
+            } else {
+                e.into()
+            }
+        })?;
+        self.metrics.inc(&self.metrics.challenges_issued);
+        self.audit.log(
+            AuditEvent::new("auth_challenge")
+                .ip(ip)
+                .user(user)
+                .field("challenge_id", &ch.id),
+        );
+        Ok(ch)
+    }
+
+    /// Verify a signed challenge and create a login.
+    pub fn verify(
+        &self,
+        challenge_id: &str,
+        signature: &str,
+        binding: &str,
+        ip: &str,
+        via: &'static str,
+    ) -> Result<(String, Login), AuthError> {
+        self.check_lockout(ip, None)?;
+        let result = self.verify_inner(challenge_id, signature, binding, ip, via);
+        match &result {
+            Ok((_, login)) => {
+                self.failures.record_success(&format!("ip:{ip}"));
+                self.failures
+                    .record_success(&format!("user:{}", login.user));
+                self.metrics.inc(&self.metrics.auth_success);
+                self.audit.log(
+                    AuditEvent::new("auth_success")
+                        .ip(ip)
+                        .user(&login.user)
+                        .field("key", &login.key_fingerprint)
+                        .field("login_id", &login.id)
+                        .field("via", via),
+                );
+            }
+            Err((user, e)) => {
+                self.metrics.inc(&self.metrics.auth_failure);
+                let mut ev = AuditEvent::new("auth_failure")
+                    .ip(ip)
+                    .field("reason", &format!("{:?}", e))
+                    .field("via", via);
+                if let Some(u) = user {
+                    ev = ev.user(u);
+                }
+                self.audit.log(ev);
+                let mut locked = self.failures.record_failure(&format!("ip:{ip}"));
+                if let Some(u) = user {
+                    locked |= self.failures.record_failure(&format!("user:{u}"));
+                }
+                if locked {
+                    self.metrics.inc(&self.metrics.auth_lockouts);
+                    let mut ev = AuditEvent::new("auth_lockout").ip(ip);
+                    if let Some(u) = user {
+                        ev = ev.user(u);
+                    }
+                    self.audit.log(ev);
+                }
+            }
+        }
+        result.map_err(|(_, e)| e)
+    }
+
+    fn verify_inner(
+        &self,
+        challenge_id: &str,
+        signature: &str,
+        binding: &str,
+        ip: &str,
+        via: &'static str,
+    ) -> Result<(String, Login), (Option<String>, AuthError)> {
+        let ch = self
+            .challenges
+            .take(challenge_id, binding)
+            .map_err(|e| (None, e.into()))?;
+        let user = Some(ch.user.clone());
+        self.check_lockout(ip, Some(&ch.user))
+            .map_err(|e| (user.clone(), e))?;
+        let keys = self
+            .keys
+            .current()
+            .map_err(|_| (user.clone(), AuthError::KeysUnavailable))?;
+        let key = challenge::verify_signature(&keys, &ch.user, &ch.message, signature)
+            .map_err(|e| (user.clone(), e.into()))?;
+        Ok(self
+            .logins
+            .create(&ch.user, &key.fingerprint, key.access.clone(), ip, via))
+    }
+
+    /// Validate a bearer token: expiry, idle timeout and that the key is still authorised.
+    /// Access rights are refreshed from the authorisation file.
+    pub fn validate(&self, token: &str) -> Option<Login> {
+        self.validate_with(token, true)
+    }
+
+    /// Like [`validate`](Self::validate) but without refreshing the idle timer; used for
+    /// periodic background checks so an idle open tab does not keep a login alive.
+    pub fn check_still_valid(&self, token: &str) -> bool {
+        self.validate_with(token, false).is_some()
+    }
+
+    fn validate_with(&self, token: &str, touch: bool) -> Option<Login> {
+        match self.logins.check(token, touch) {
+            LoginState::Valid(mut login) => {
+                if self.revalidate(&mut login) {
+                    Some(login)
+                } else {
+                    self.logins.revoke_token(token);
+                    self.audit.log(
+                        AuditEvent::new("login_revoked")
+                            .user(&login.user)
+                            .field("login_id", &login.id)
+                            .field("reason", "key no longer authorised"),
+                    );
+                    None
+                }
+            }
+            LoginState::Expired | LoginState::Idle => None,
+            LoginState::Unknown => None,
+        }
+    }
+
+    /// Re-check a login against the current authorisation file; updates access in place.
+    pub fn revalidate(&self, login: &mut Login) -> bool {
+        match self.keys.current() {
+            Ok(keys) => match keys.by_fingerprint(&login.key_fingerprint) {
+                Some(k) if k.user == login.user => {
+                    if k.access != login.access {
+                        login.access = k.access.clone();
+                        self.logins.update_access(&login.id, k.access.clone());
+                    }
+                    true
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        }
+    }
+
+    /// Revoke logins whose key was removed from the authorisation file. Returns revoked ids.
+    pub fn sweep_revoked_keys(&self) -> Vec<String> {
+        let keys = self.keys.current().ok();
+        let gone = self.logins.revoke_where(|l| match &keys {
+            Some(k) => !matches!(k.by_fingerprint(&l.key_fingerprint), Some(x) if x.user == l.user),
+            None => true,
+        });
+        for l in &gone {
+            self.audit.log(
+                AuditEvent::new("login_revoked")
+                    .user(&l.user)
+                    .field("login_id", &l.id)
+                    .field("reason", "key no longer authorised"),
+            );
+        }
+        gone.into_iter().map(|l| l.id).collect()
+    }
+
+    pub fn purge(&self) {
+        self.challenges.purge();
+        self.challenge_rl.purge();
+        self.failures.purge();
+        for l in self.logins.purge() {
+            self.audit.log(
+                AuditEvent::new("login_expired")
+                    .user(&l.user)
+                    .field("login_id", &l.id),
+            );
+        }
+    }
+}

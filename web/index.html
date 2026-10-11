@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="same-origin">
+  <title>sshweb</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/assets/vendor/xterm.css">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">sshweb</div>
+    <div class="status" id="status" role="status" aria-live="polite">
+      <span class="dot" id="status-dot"></span><span id="status-text">Not connected</span>
+    </div>
+    <div class="spacer"></div>
+    <span class="who hidden" id="who"></span>
+    <button class="ghost hidden" id="btn-terminal-view" title="Back to terminal">Terminal</button>
+    <button class="ghost hidden" id="btn-settings" title="Settings">Settings</button>
+    <button class="ghost" id="btn-theme" title="Toggle light/dark theme">Theme</button>
+    <button class="ghost hidden" id="btn-logout">Log out</button>
+  </header>
+
+  <!-- Login -->
+  <main id="view-login" class="view hidden">
+    <section class="card login">
+      <h1>Sign in with your SSH key</h1>
+      <p class="muted">Your private key never leaves your machine. You sign a one-time challenge
+        locally with <code>ssh-keygen</code> and paste the signature here.</p>
+
+      <form id="form-user" class="row" autocomplete="off">
+        <label for="login-user">User</label>
+        <input id="login-user" name="user" required maxlength="32" pattern="[a-z_][a-z0-9_.\-]*" spellcheck="false" autocapitalize="off">
+        <label for="login-key">Key file</label>
+        <input id="login-key" value="~/.ssh/id_ed25519" spellcheck="false" autocapitalize="off">
+        <button type="submit" class="primary">Get challenge</button>
+      </form>
+
+      <div id="challenge-step" class="hidden">
+        <p>1. Run this in a terminal on <strong>your</strong> computer. It signs the challenge and copies the signature
+          (on macOS, <code>pbcopy</code>). Check that the origin in the message is this gateway.</p>
+        <div class="cmd">
+          <pre id="sign-cmd"></pre>
+          <button type="button" id="btn-copy-cmd" class="ghost">Copy</button>
+        </div>
+        <details>
+          <summary>Other ways to sign</summary>
+          <p class="muted">With the sshweb binary: <code id="alt-cmd"></code></p>
+          <p class="muted">Key in ssh-agent: point <code>-f</code> at the <code>.pub</code> file.
+            Encrypted keys prompt for their passphrase locally.</p>
+        </details>
+        <form id="form-sig">
+          <p>2. Paste the signature (<code>-----BEGIN SSH SIGNATURE-----</code> …):</p>
+          <textarea id="login-sig" rows="7" spellcheck="false" required></textarea>
+          <div class="row">
+            <button type="submit" class="primary">Sign in</button>
+            <span class="muted" id="challenge-expiry"></span>
+          </div>
+        </form>
+      </div>
+      <p class="error" id="login-error" role="alert"></p>
+    </section>
+  </main>
+
+  <!-- Terminal -->
+  <main id="view-term" class="view hidden">
+    <aside class="sidebar">
+      <section>
+        <h2>New tab</h2>
+        <label for="target">Target</label>
+        <select id="target"></select>
+        <div id="shell-row">
+          <label for="shell">Shell</label>
+          <select id="shell"></select>
+        </div>
+        <div id="target-info" class="muted small"></div>
+        <button class="primary wide" id="btn-connect">Open in new tab</button>
+      </section>
+      <section>
+        <div class="row between">
+          <h2>Sessions</h2>
+          <button class="ghost small" id="btn-refresh" title="Refresh">↻</button>
+        </div>
+        <ul id="session-list" class="sessions"></ul>
+      </section>
+    </aside>
+    <section class="termpane">
+      <div class="tabstrip" role="tablist" aria-label="Terminal tabs">
+        <div id="tabs" class="tabs"></div>
+        <button class="ghost newtab" id="btn-newtab" title="New tab with the selected target">+</button>
+      </div>
+      <div class="toolbar">
+        <span id="term-title" class="title" title="Double-click to rename">No session</span>
+        <div class="spacer"></div>
+        <button class="ghost" id="btn-rename" title="Rename this session">Rename</button>
+        <button class="ghost" id="btn-clear" title="Clear (Ctrl+Shift+K)">Clear</button>
+        <button class="ghost" id="btn-reconnect" title="Reconnect (Ctrl+Shift+U)">Reconnect</button>
+        <button class="ghost" id="btn-detach" title="Disconnect but keep the session running (Ctrl+Shift+X)">Disconnect</button>
+        <button class="danger" id="btn-close" title="End the session">End session</button>
+      </div>
+      <div id="terminals" class="terminals">
+        <div id="empty" class="empty hidden">
+          <p>No open tabs.</p>
+          <p class="muted">Choose a target on the left and press <strong>Open in new tab</strong>.
+            Your tabs are remembered and restored the next time you sign in.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Settings -->
+  <main id="view-settings" class="view hidden">
+    <section class="card settings">
+      <h1>Settings</h1>
+      <h2>Appearance</h2>
+      <div class="grid2">
+        <label for="set-theme">Theme</label>
+        <select id="set-theme"><option value="dark">Dark</option><option value="light">Light</option></select>
+        <label for="set-font">Font size</label>
+        <input id="set-font" type="number" min="9" max="28" step="1">
+        <label for="set-meta">Option key as Meta</label>
+        <input id="set-meta" type="checkbox">
+      </div>
+      <h2>Your access</h2>
+      <div class="grid2" id="access-info"></div>
+      <h2>Permitted connection profiles</h2>
+      <p class="muted">Profiles are defined by the administrator in the gateway configuration.</p>
+      <table class="profiles">
+        <thead><tr><th>Profile</th><th>Destination</th></tr></thead>
+        <tbody id="profile-rows"></tbody>
+      </table>
+      <h2>Keyboard shortcuts</h2>
+      <table class="profiles">
+        <tbody>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd></td><td>Clear terminal</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd></td><td>Reconnect</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd></td><td>Disconnect (session keeps running)</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>D</kbd> / <kbd>Z</kbd></td><td>Sent to the terminal</td></tr>
+          <tr><td><kbd>⌘</kbd>+<kbd>C</kbd> / <kbd>⌘</kbd>+<kbd>V</kbd></td><td>Copy selection / paste</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <div id="toasts" class="toasts" aria-live="assertive"></div>
+
+  <script src="/assets/vendor/xterm.js"></script>
+  <script src="/assets/vendor/addon-fit.js"></script>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

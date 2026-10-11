@@ -1,0 +1,95 @@
+# sshweb configuration.
+#
+# Relative paths are resolved against the directory containing this file; `~/` expands to $HOME.
+# Never put private keys or passwords in this file. Environment overrides:
+#   SSHWEB_BIND, SSHWEB_PORT, SSHWEB_ALLOW_REMOTE_ACCESS, SSHWEB_TLS_CERT, SSHWEB_TLS_KEY,
+#   SSHWEB_STATE_DIR, SSHWEB_AUTHORIZED_KEYS, SSHWEB_KNOWN_HOSTS, SSHWEB_AUDIT_LOG,
+#   SSHWEB_LOG_LEVEL, SSHWEB_CONFIG (config file path), SSHWEB_HOME (default config dir).
+
+server:
+  # Loopback only by default. A non-loopback address additionally requires
+  # allow_remote_access: true AND TLS.
+  bind: 127.0.0.1
+  port: 7681
+  allow_remote_access: false
+  # Origins browsers may use besides the bind address itself, e.g. "https://mac.example.net:7681".
+  allowed_origins: []
+  # Reverse proxies (exact IPs) allowed to report the real client IP via X-Forwarded-For.
+  trusted_proxies: []
+  tls:
+    cert: null     # e.g. tls/cert.pem
+    key: null      # e.g. tls/key.pem (mode 0600)
+  # Runtime state; holds the admin socket used by `sshweb sessions` and `sshweb health`.
+  state_dir: run
+
+auth:
+  # Administrator-managed list of public keys allowed to log in. See README "Key management".
+  authorized_keys: authorized_keys
+  challenge_ttl_secs: 120
+  session_ttl_secs: 28800          # absolute login lifetime (8h)
+  session_idle_timeout_secs: 1800  # login expires after 30 min without activity
+  min_rsa_bits: 2048
+
+local:
+  enabled: true
+  default_shell: null   # null = $SHELL if allowed, else first allowed shell
+  allowed_shells: [/bin/zsh, /bin/bash, /bin/sh]
+  login_shell: true
+  working_dir: null     # null = $HOME
+
+remote:
+  enabled: false
+  ssh_binary: /usr/bin/ssh
+  ssh_keyscan_binary: /usr/bin/ssh-keyscan
+  # Only host keys in this file are trusted. Add hosts with `sshweb hosts trust`.
+  known_hosts: known_hosts
+  connect_timeout_secs: 10
+  keepalive_interval_secs: 30
+  keepalive_count_max: 3
+  use_agent: false      # forward the gateway's SSH_AUTH_SOCK to ssh for key auth
+  # Ad-hoc targets are disabled; only the profiles below can be used.
+  allow_adhoc: false
+  allowed_hosts: []
+  allowed_ports: [22]
+  allowed_users: []
+  profiles: []
+  # profiles:
+  #   - id: web1
+  #     name: "Web server 1"
+  #     host: web1.example.net
+  #     port: 22
+  #     user: deploy
+  #     identity_file: ~/.ssh/id_ed25519   # optional; key stays on this Mac
+
+sessions:
+  max_total: 16
+  max_per_user: 8
+  idle_timeout_secs: 3600     # close a terminal after 1h without keyboard input (0 = never)
+  detach_grace_secs: 1800     # keep a terminal running this long after its browser tab closes (resume window)
+  scrollback_bytes: 262144
+
+limits:
+  ws_max_message_bytes: 65536
+  max_websockets: 64
+  input_bytes_per_sec: 262144
+  input_burst_bytes: 1048576
+  max_http_body_bytes: 32768
+
+rate_limit:
+  challenges_per_minute: 20   # per client IP
+  max_failures: 5             # failed logins per IP or per user within the window...
+  failure_window_secs: 300
+  lockout_secs: 900           # ...trigger a lockout of this length
+
+audit:
+  destination: file   # file | stderr | off
+  path: audit.log
+
+metrics:
+  # Expose Prometheus metrics at /metrics on the HTTP port (loopback clients only).
+  # Metrics are always available on the admin socket.
+  enabled: false
+
+logging:
+  format: pretty      # pretty | json
+  level: info
