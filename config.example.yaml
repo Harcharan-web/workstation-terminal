@@ -14,7 +14,8 @@ server:
   allow_remote_access: false
   # Origins browsers may use besides the bind address itself, e.g. "https://mac.example.net:7681".
   allowed_origins: []
-  # Reverse proxies (exact IPs) allowed to report the real client IP via X-Forwarded-For.
+  # Reverse proxies (exact IPs) allowed to report the real client IP via X-Forwarded-For
+  # (or X-Real-IP when they send no X-Forwarded-For).
   trusted_proxies: []
   tls:
     cert: null     # e.g. tls/cert.pem
