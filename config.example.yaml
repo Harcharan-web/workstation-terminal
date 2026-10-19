@@ -94,3 +94,8 @@ metrics:
 logging:
   format: pretty      # pretty | json
   level: info
+
+# Optional: notify OpsAPI when a session is opened with opsapi_task (task deep-link).
+# opsapi:
+#   webhook_url: https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal/webhook
+#   webhook_secret: "shared-secret-matching-WORKSTATION_TERMINAL_WEBHOOK_SECRET"

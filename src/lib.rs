@@ -7,6 +7,7 @@ pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod metrics;
+pub mod opsapi;
 pub mod security;
 pub mod server;
 pub mod session;

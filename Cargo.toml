@@ -38,9 +38,9 @@ tower = "0.5.3"
 tower-http = { version = "0.7.1", features = ["set-header", "limit"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "cookies"] }
 
 [dev-dependencies]
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "cookies"] }
 tempfile = "3.27.0"
 tokio-tungstenite = "0.30.0"
 

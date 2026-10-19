@@ -93,6 +93,15 @@ button.wide { width: 100%; margin-top: 10px; }
 details { margin: 10px 0; }
 
 #view-term { display: flex; }
+.opsapi-banner {
+  padding: 8px 12px;
+  font-size: 12px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+}
+.opsapi-banner a { color: var(--accent); }
+.opsapi-banner.hidden { display: none; }
 .sidebar {
   width: 260px; flex-shrink: 0; border-right: 1px solid var(--border); background: var(--panel);
   padding: 12px; overflow: auto;
