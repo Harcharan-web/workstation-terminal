@@ -11,6 +11,17 @@
   const PROTOCOL_VERSION = 1;
   const $ = (id) => document.getElementById(id);
   const prefs = loadPrefs();
+  // Deep-link context from OpsAPI task manager (?opsapi_task=&repo=&return=).
+  const launchCtx = (function () {
+    try {
+      const q = new URLSearchParams(location.search);
+      const task = q.get("opsapi_task") || "";
+      const repo = q.get("repo") || "";
+      const ret = q.get("return") || "";
+      if (!task && !repo && !ret) return null;
+      return { opsapi_task: task || null, repo: repo || null, return_url: ret || null };
+    } catch (_) { return null; }
+  })();
 
   // ---------- small utilities ----------
   function loadPrefs() {
@@ -261,6 +272,7 @@
           } else if (this.pending && this.pending.open) {
             const msg = { type: "open", target: this.pending.open, cols: this.term.cols, rows: this.term.rows };
             if (this.name) msg.name = this.name;
+            if (launchCtx && launchCtx.opsapi_task) msg.opsapi_task = launchCtx.opsapi_task;
             this.send(msg);
           }
           break;
@@ -722,7 +734,24 @@
     refreshSessions();
   }
 
+  function showOpsapiBanner() {
+    const el = $("opsapi-banner");
+    if (!el || !launchCtx) return;
+    const parts = [];
+    if (launchCtx.opsapi_task) parts.push("OpsAPI task " + launchCtx.opsapi_task.slice(0, 8) + "…");
+    if (launchCtx.repo) {
+      parts.push('<a href="' + launchCtx.repo.replace(/"/g, "&quot;") + '" target="_blank" rel="noreferrer">repo</a>');
+    }
+    if (launchCtx.return_url) {
+      parts.push('<a href="' + launchCtx.return_url.replace(/"/g, "&quot;") + '" target="_blank" rel="noreferrer">back to task</a>');
+    }
+    if (!parts.length) return;
+    el.innerHTML = "Working from OpsAPI — " + parts.join(" · ");
+    el.classList.remove("hidden");
+  }
+
   // ---------- init ----------
+  showOpsapiBanner();
   $("set-theme").value = prefs.theme;
   $("set-font").value = prefs.fontSize;
   $("set-meta").checked = !!prefs.optionMeta;

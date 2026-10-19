@@ -135,6 +135,8 @@ pub struct TerminalSession {
     pub target: Target,
     pub title: String,
     pub created_unix: u64,
+    /// OpsAPI kanban task uuid when opened from a task deep-link (optional).
+    pub opsapi_task: Option<String>,
     pty: PtyProcess,
     name: Mutex<Option<String>>,
     scrollback: Mutex<Scrollback>,
@@ -306,6 +308,7 @@ impl SessionManager {
         target: Target,
         spec: PtySpec,
         name: Option<String>,
+        opsapi_task: Option<String>,
     ) -> Result<Arc<TerminalSession>, OpenError> {
         if self.shutting_down.is_cancelled() {
             return Err(OpenError::ShuttingDown);
@@ -332,6 +335,7 @@ impl SessionManager {
             title: target.title(),
             target,
             created_unix: unix_now(),
+            opsapi_task,
             pty,
             scrollback: Mutex::new(Scrollback {
                 buf: VecDeque::new(),
@@ -366,7 +370,18 @@ impl SessionManager {
                 .field("remote_user", &t.user)
                 .field("profile", t.profile.as_deref().unwrap_or("adhoc"));
         }
+        if let Some(t) = &sess.opsapi_task {
+            ev = ev.field("opsapi_task", t);
+        }
         self.audit.log(ev);
+
+        crate::opsapi::notify(
+            &self.cfg.opsapi,
+            "session_start",
+            &sess.id,
+            &sess.user,
+            sess.opsapi_task.as_deref(),
+        );
 
         let mgr = self.clone();
         let s2 = sess.clone();
@@ -460,6 +475,13 @@ impl SessionManager {
                     "duration_secs",
                     unix_now().saturating_sub(sess.created_unix) as i64,
                 ),
+        );
+        crate::opsapi::notify(
+            &self.cfg.opsapi,
+            "session_end",
+            &sess.id,
+            &sess.user,
+            sess.opsapi_task.as_deref(),
         );
     }
 
@@ -677,7 +699,7 @@ mod tests {
     async fn exit_closes_session_and_reports_code() {
         let m = mgr(Config::default());
         let s = m
-            .open(&login("a"), local(), spec("echo hi; exit 4"), None)
+            .open(&login("a"), local(), spec("echo hi; exit 4"), None, None)
             .unwrap();
         let (mut rx, _) = m.attach(&s, 1);
         let (reason, code) = next_closed(&mut rx).await;
@@ -693,22 +715,22 @@ mod tests {
         cfg.sessions.max_total = 2;
         let m = mgr(cfg);
         let a = login("a");
-        let _s1 = m.open(&a, local(), spec("sleep 30"), None).unwrap();
+        let _s1 = m.open(&a, local(), spec("sleep 30"), None, None).unwrap();
         assert_eq!(
-            m.open(&a, local(), spec("sleep 30"), None).err(),
+            m.open(&a, local(), spec("sleep 30"), None, None).err(),
             Some(OpenError::UserLimit(1))
         );
         let _s2 = m
-            .open(&login("b"), local(), spec("sleep 30"), None)
+            .open(&login("b"), local(), spec("sleep 30"), None, None)
             .unwrap();
         assert_eq!(
-            m.open(&login("c"), local(), spec("sleep 30"), None).err(),
+            m.open(&login("c"), local(), spec("sleep 30"), None, None).err(),
             Some(OpenError::TotalLimit(2))
         );
         m.shutdown().await;
         assert_eq!(m.count(), 0);
         assert_eq!(
-            m.open(&login("d"), local(), spec("true"), None).err(),
+            m.open(&login("d"), local(), spec("true"), None, None).err(),
             Some(OpenError::ShuttingDown)
         );
     }
@@ -717,7 +739,7 @@ mod tests {
     async fn reattach_replays_output_and_detaches_old() {
         let m = mgr(Config::default());
         let s = m
-            .open(&login("a"), local(), spec("echo MARKER; sleep 30"), None)
+            .open(&login("a"), local(), spec("echo MARKER; sleep 30"), None, None)
             .unwrap();
         let (mut rx1, _) = m.attach(&s, 1);
         // Wait for output on the first connection.
@@ -745,7 +767,7 @@ mod tests {
         cfg.sessions.detach_grace_secs = 0;
         let m = mgr(cfg);
         let s = m
-            .open(&login("a"), local(), spec("sleep 30"), None)
+            .open(&login("a"), local(), spec("sleep 30"), None, None)
             .unwrap();
         m.reap();
         assert!(s.is_closed());
@@ -754,7 +776,7 @@ mod tests {
         cfg.sessions.idle_timeout_secs = 1;
         let m2 = mgr(cfg);
         let s2 = m2
-            .open(&login("a"), local(), spec("sleep 30"), None)
+            .open(&login("a"), local(), spec("sleep 30"), None, None)
             .unwrap();
         let (mut rx, _) = m2.attach(&s2, 1);
         m2.reap();
@@ -771,7 +793,7 @@ mod tests {
         let m = mgr(Config::default());
         let first = login("a");
         let s = m
-            .open(&first, local(), spec("sleep 30"), Some("build".into()))
+            .open(&first, local(), spec("sleep 30"), Some("build".into()), None)
             .unwrap();
         assert_eq!(s.info().name.as_deref(), Some("build"));
         assert_eq!(s.login_id(), first.id);
@@ -787,7 +809,7 @@ mod tests {
     async fn explicit_close_kills_process() {
         let m = mgr(Config::default());
         let s = m
-            .open(&login("a"), local(), spec("sleep 300"), None)
+            .open(&login("a"), local(), spec("sleep 300"), None, None)
             .unwrap();
         let pid = s.pid().unwrap();
         let (mut rx, _) = m.attach(&s, 1);

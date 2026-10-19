@@ -28,6 +28,9 @@ pub enum ClientMsg {
         /// Initial session name (e.g. the restored tab's name).
         #[serde(default)]
         name: Option<String>,
+        /// OpsAPI kanban task uuid when launched from a task deep-link.
+        #[serde(default)]
+        opsapi_task: Option<String>,
     },
     Attach {
         session_id: String,
@@ -180,6 +183,7 @@ fn validate(m: &ClientMsg) -> Result<(), DecodeError> {
             rows,
             target,
             name,
+            opsapi_task,
         } => {
             if !size_ok(*cols, *rows) {
                 return Err(DecodeError::Invalid("size"));
@@ -189,6 +193,15 @@ fn validate(m: &ClientMsg) -> Result<(), DecodeError> {
                 .is_some_and(|n| crate::session::normalize_name(n).is_err())
             {
                 return Err(DecodeError::Invalid("name"));
+            }
+            if opsapi_task.as_deref().is_some_and(|t| {
+                t.is_empty()
+                    || t.len() > 64
+                    || !t
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit() || c == '-')
+            }) {
+                return Err(DecodeError::Invalid("opsapi_task"));
             }
             match target {
                 OpenTarget::Local { shell: Some(s) } if s.len() > 256 => {

@@ -23,6 +23,17 @@ pub struct Config {
     pub audit: AuditConfig,
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
+    /// Optional OpsAPI task bridge (webhook when a session carries `opsapi_task`).
+    pub opsapi: OpsapiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpsapiConfig {
+    /// e.g. https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal/webhook
+    pub webhook_url: Option<String>,
+    /// Shared secret; OpsAPI verifies `X-Opsapi-Signature: sha256=<hmac-hex>`.
+    pub webhook_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +210,16 @@ impl Default for Config {
             audit: AuditConfig::default(),
             metrics: MetricsConfig { enabled: false },
             logging: LoggingConfig::default(),
+            opsapi: OpsapiConfig::default(),
+        }
+    }
+}
+
+impl Default for OpsapiConfig {
+    fn default() -> Self {
+        Self {
+            webhook_url: None,
+            webhook_secret: None,
         }
     }
 }
@@ -417,6 +438,12 @@ impl Config {
         }
         if let Some(v) = var("SSHWEB_LOG_LEVEL") {
             self.logging.level = v;
+        }
+        if let Some(v) = var("SSHWEB_OPSAPI_WEBHOOK_URL") {
+            self.opsapi.webhook_url = Some(v);
+        }
+        if let Some(v) = var("SSHWEB_OPSAPI_WEBHOOK_SECRET") {
+            self.opsapi.webhook_secret = Some(v);
         }
         Ok(())
     }

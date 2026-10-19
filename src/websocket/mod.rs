@@ -391,6 +391,7 @@ impl Conn {
                 cols,
                 rows,
                 name,
+                opsapi_task,
             } => {
                 if self.session.is_some() {
                     return self.protocol_error("this connection already has a session", out);
@@ -444,7 +445,8 @@ impl Conn {
                     }
                 };
                 let name = name.and_then(|n| crate::session::normalize_name(&n).ok().flatten());
-                match app.sessions.open(&login, target, spec, name) {
+                let opsapi_task = opsapi_task.filter(|t| !t.is_empty());
+                match app.sessions.open(&login, target, spec, name, opsapi_task) {
                     Ok(s) => {
                         let (rx, _) = app.sessions.attach(&s, self.id);
                         out.push(text(ServerMsg::SessionOpened {
