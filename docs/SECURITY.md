@@ -42,6 +42,11 @@
 | T19 | **Orphaned processes** | Each session's child is a session leader. On close the whole process group gets SIGHUP, then SIGKILL after a grace period. Graceful shutdown closes every session. | `terminate_kills_process_group`, `graceful_shutdown_closes_sessions_and_sockets` |
 | T20 | **Accidental exposure** | A non-loopback bind needs `allow_remote_access: true` **and** TLS. A wildcard bind needs explicit `allowed_origins`. Metrics are off on the HTTP port by default and loopback-only when enabled. Admin functions exist only on the private Unix socket. | `remote_exposure_requires_opt_in_tls_and_origins`, `serve_refuses_unsafe_remote_exposure` |
 
+| T21 | **Forged or replayed task links** (OpsAPI) | Links are HMAC-SHA256 signed with a secret shared only with OpsAPI (constant-time check), expire (≤ 1 h), and open once; a link accepted by one user can't be claimed or opened by another. A link never signs anyone in: the person still proves their SSH key. | `tampered_wrong_key_expired_and_long_lived_links_are_refused`, `bad_links_are_refused`, `launches_are_single_use_per_user` |
+| T22 | **Folder escape** via a link or a saved tab | The folder is resolved with `realpath` (symlinks followed) and must be an existing directory inside `local.allowed_roots`; without roots, folders and links are refused. Roots choose where a tab starts; they are not a sandbox: the shell can go anywhere the account can (see "A separate macOS account" in OPSAPI.md). | `folders_must_be_real_directories_inside_a_root`, `tabs_may_reopen_in_an_allowed_folder_only` |
+| T23 | **Command injection** through task text | A link carries an agent **id**; command lines come only from `opsapi.agents` in the config. Task text (prompt, title) reaches the shell only as environment variables, never as shell syntax; control characters are stripped. The banner is built with `textContent`. | `task_link_opens_the_folder_starts_the_agent_and_reports_to_opsapi`, `bad_fields_are_refused` |
+| T24 | **Webhook spoofing** towards OpsAPI | Webhooks are HMAC-signed and carry only the launch id (OpsAPI looks the task up from its own record, never from the webhook) and a timestamp OpsAPI checks. | `task_link_opens_the_folder_starts_the_agent_and_reports_to_opsapi` |
+
 ## Residual risks and limitations
 
 - **Relay phishing.** The copy-paste flow can't bind the signature to the browser's real origin the
@@ -67,6 +72,9 @@
   Lockouts are temporary (`rate_limit.lockout_secs`).
 - **Trust in dependencies.** RustCrypto `ssh-key` (signature verification), `rustls` (TLS),
   OpenSSH (remote transport, host keys), `portable-pty` and xterm.js.
+- **Task text is untrusted input to agents.** Anyone who can edit a task in OpsAPI can steer the agent
+  it starts (prompt injection). Run task terminals under an account with no access to anything the work
+  doesn't need (docs/OPSAPI.md, "A separate macOS account").
 - **No external audit yet.**
 
 ## Operational guidance

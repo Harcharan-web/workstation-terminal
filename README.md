@@ -193,6 +193,14 @@ real PTY, running as the user who runs sshweb. Users can choose any shell listed
 Every gateway identity gets a shell as the **same macOS user** (the one running sshweb). sshweb runs
 unprivileged and can't switch users. Run separate instances under separate accounts if you need separation.
 
+## OpsAPI task links
+
+OpsAPI can open a task straight into a tab here: a folder under `local.allowed_roots`, an agent from
+`opsapi.agents` started with the task as its first message, and a webhook back to OpsAPI when the session
+starts and ends. Links are signed, expire, work once and never sign anyone in. Task tabs stay alive while
+the agent works (output counts as activity). Setup, the contract and running task terminals under a
+separate macOS account: [docs/OPSAPI.md](docs/OPSAPI.md).
+
 ## Tabs and resuming
 
 Closing the browser doesn't end your shells. A terminal whose browser went away keeps running,

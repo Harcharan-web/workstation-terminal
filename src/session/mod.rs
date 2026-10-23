@@ -135,14 +135,16 @@ pub struct TerminalSession {
     pub target: Target,
     pub title: String,
     pub created_unix: u64,
-    /// OpsAPI kanban task uuid when opened from a task deep-link (optional).
-    pub opsapi_task: Option<String>,
+    /// The OpsAPI launch this session was opened from. Task sessions follow the `opsapi`
+    /// keep-alive limits and report start/end to OpsAPI.
+    pub launch: Option<crate::opsapi::LaunchTag>,
     pty: PtyProcess,
     name: Mutex<Option<String>>,
     scrollback: Mutex<Scrollback>,
     attached: Mutex<Option<Attachment>>,
     detached_since: Mutex<Option<Instant>>,
     last_input: Mutex<Instant>,
+    last_output: Mutex<Instant>,
     closed: CancellationToken,
     close_reason: Mutex<Option<String>>,
     metrics: Arc<Metrics>,
@@ -308,7 +310,7 @@ impl SessionManager {
         target: Target,
         spec: PtySpec,
         name: Option<String>,
-        opsapi_task: Option<String>,
+        launch: Option<crate::opsapi::LaunchTag>,
     ) -> Result<Arc<TerminalSession>, OpenError> {
         if self.shutting_down.is_cancelled() {
             return Err(OpenError::ShuttingDown);
@@ -335,7 +337,7 @@ impl SessionManager {
             title: target.title(),
             target,
             created_unix: unix_now(),
-            opsapi_task,
+            launch,
             pty,
             scrollback: Mutex::new(Scrollback {
                 buf: VecDeque::new(),
@@ -344,6 +346,7 @@ impl SessionManager {
             attached: Mutex::new(None),
             detached_since: Mutex::new(Some(Instant::now())),
             last_input: Mutex::new(Instant::now()),
+            last_output: Mutex::new(Instant::now()),
             closed: CancellationToken::new(),
             close_reason: Mutex::new(None),
             name: Mutex::new(name),
@@ -370,18 +373,14 @@ impl SessionManager {
                 .field("remote_user", &t.user)
                 .field("profile", t.profile.as_deref().unwrap_or("adhoc"));
         }
-        if let Some(t) = &sess.opsapi_task {
-            ev = ev.field("opsapi_task", t);
+        if let Some(t) = &sess.launch {
+            ev = ev.field("opsapi_launch", &t.id).field("opsapi_task", &t.task);
         }
         self.audit.log(ev);
 
-        crate::opsapi::notify(
-            &self.cfg.opsapi,
-            "session_start",
-            &sess.id,
-            &sess.user,
-            sess.opsapi_task.as_deref(),
-        );
+        if let Some(t) = &sess.launch {
+            crate::opsapi::notify(&self.cfg, "session_start", t, &sess.id, &sess.user, None, None);
+        }
 
         let mgr = self.clone();
         let s2 = sess.clone();
@@ -437,6 +436,7 @@ impl SessionManager {
 
     async fn forward_output(&self, sess: &TerminalSession, b: Bytes) {
         self.metrics.add(&self.metrics.bytes_out, b.len() as u64);
+        *sess.last_output.lock().unwrap() = Instant::now();
         // Lock order (attached, then scrollback) matches attach(), so a re-attach sees each
         // chunk exactly once: either in the snapshot or as a live event.
         let target = {
@@ -476,13 +476,17 @@ impl SessionManager {
                     unix_now().saturating_sub(sess.created_unix) as i64,
                 ),
         );
-        crate::opsapi::notify(
-            &self.cfg.opsapi,
-            "session_end",
-            &sess.id,
-            &sess.user,
-            sess.opsapi_task.as_deref(),
-        );
+        if let Some(t) = &sess.launch {
+            crate::opsapi::notify(
+                &self.cfg,
+                "session_end",
+                t,
+                &sess.id,
+                &sess.user,
+                exit_code,
+                Some(&reason),
+            );
+        }
     }
 
     /// Attach a connection, replacing any previous attachment. Returns the event stream and
@@ -550,21 +554,35 @@ impl SessionManager {
 
     /// Periodic policy enforcement: detach grace and idle timeout. Authorisation (revoked or
     /// narrowed keys) is enforced separately by the server against the key fingerprint.
+    /// Task sessions (opened from an OpsAPI launch) use the `opsapi` limits, and their output
+    /// counts as activity, so an agent working on its own isn't closed for lack of typing.
     pub fn reap(&self) {
-        let grace = Duration::from_secs(self.cfg.sessions.detach_grace_secs);
-        let idle = self.cfg.sessions.idle_timeout_secs;
         let all: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
         for s in all {
             if s.is_closed() {
                 continue;
             }
+            let (grace, idle) = if s.launch.is_some() {
+                (self.cfg.opsapi.detach_grace_secs, self.cfg.opsapi.idle_timeout_secs)
+            } else {
+                (self.cfg.sessions.detach_grace_secs, self.cfg.sessions.idle_timeout_secs)
+            };
             if let Some(t) = *s.detached_since.lock().unwrap()
-                && t.elapsed() >= grace
+                && t.elapsed() >= Duration::from_secs(grace)
             {
                 request_close(&s, "disconnected for too long");
                 continue;
             }
-            if idle > 0 && s.last_input.lock().unwrap().elapsed() >= Duration::from_secs(idle) {
+            let quiet = if s.launch.is_some() {
+                s.last_input
+                    .lock()
+                    .unwrap()
+                    .elapsed()
+                    .min(s.last_output.lock().unwrap().elapsed())
+            } else {
+                s.last_input.lock().unwrap().elapsed()
+            };
+            if idle > 0 && quiet >= Duration::from_secs(idle) {
                 request_close(&s, "idle timeout");
             }
         }
@@ -785,6 +803,37 @@ mod tests {
         m2.reap();
         let (reason, _) = next_closed(&mut rx).await;
         assert_eq!(reason, "idle timeout");
+        m.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task_sessions_count_output_as_activity_and_outlive_the_browser() {
+        let mut cfg = Config::default();
+        cfg.sessions.idle_timeout_secs = 1;
+        cfg.sessions.detach_grace_secs = 0;
+        cfg.opsapi.idle_timeout_secs = 1;
+        cfg.opsapi.detach_grace_secs = 3600;
+        let m = mgr(cfg);
+        let tag = || {
+            Some(crate::opsapi::LaunchTag {
+                id: "l1".into(),
+                task: "t1".into(),
+            })
+        };
+        let a = login("a");
+        // An agent printing on its own, with nobody typing and no browser attached.
+        let busy = m
+            .open(&a, local(), spec("while true; do echo working; sleep 0.2; done"), None, tag())
+            .unwrap();
+        let quiet = m.open(&a, local(), spec("sleep 30"), None, tag()).unwrap();
+        let plain = m.open(&a, local(), spec("sleep 30"), None, None).unwrap();
+        m.reap();
+        assert!(plain.is_closed(), "ordinary sessions keep the normal detach limit");
+        assert!(!busy.is_closed() && !quiet.is_closed(), "task sessions survive a closed browser");
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        m.reap();
+        assert!(!busy.is_closed(), "output counts as activity");
+        assert!(quiet.is_closed(), "no input and no output: idle");
         m.shutdown().await;
     }
 

@@ -34,7 +34,7 @@ The login is re-validated (expiry, revocation, key still authorised) on every te
 | `hello` | `version: 1` | Must be first. |
 | `auth_request` | `user` | Only when not authenticated. Returns `auth_challenge` or `auth_failed`. |
 | `auth_response` | `challenge_id`, `signature` (armored SSHSIG) | Returns `auth_ok` or `auth_failed`. |
-| `open` | `target`, `cols` (1–1000), `rows` (1–500) | Optional `name` sets the session label. `target` is `{"kind":"local","shell":"/bin/zsh"?}`, `{"kind":"remote","profile":"web1"}` or `{"kind":"adhoc","host","port"?,"user"}`. |
+| `open` | `target`, `cols` (1–1000), `rows` (1–500) | Optional `name` sets the session label. `target` is `{"kind":"local","shell":"/bin/zsh"?,"cwd":"/abs/folder"?}`, `{"kind":"remote","profile":"web1"}` or `{"kind":"adhoc","host","port"?,"user"}`. `cwd` must be inside `local.allowed_roots`. Optional `launch` (with a local target) opens an OpsAPI task link accepted by `POST /api/launch`; its folder, agent and environment come from the launch, and each launch opens once. |
 | `attach` | `session_id`, `cols`, `rows` | Resume your own detached session. Replays scrollback **output** only. |
 | `input` | `data`, `binary`? | Keystrokes. With `binary: true`, each char is a byte (0–255). |
 | `resize` | `cols`, `rows` | |
@@ -96,7 +96,8 @@ keystrokes typed while disconnected. Attaching from a second window takes over t
 | `GET /api/me` | cookie | Identity, access, permitted profiles and shells |
 | `GET /api/sessions` | cookie | Your sessions and their state |
 | `GET /api/workspace` | cookie | Your saved tabs: `{tabs:[{id, target, name, session_id}], active}` |
-| `PUT /api/workspace` | cookie + Origin | Save tabs (≤ 16, validated; last writer wins) |
+| `PUT /api/workspace` | cookie + Origin | Save tabs (≤ 16, validated; last writer wins). Local tabs may carry `cwd`. |
+| `POST /api/launch` `{ticket}` | cookie + Origin | Accept an OpsAPI task link: `{launch, name, cwd, agent:{id,name}, task:{uuid,number,title,url}, by, workspace, used, session_id}`. See [OPSAPI.md](OPSAPI.md). |
 | `DELETE /api/sessions/{id}` | cookie + Origin | Close one of your sessions |
 | `PATCH /api/sessions/{id}` `{name}` | cookie + Origin | Rename one of your sessions (≤ 64 chars, no control characters; empty resets) |
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness (no sensitive detail) |

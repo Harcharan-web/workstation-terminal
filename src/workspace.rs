@@ -44,6 +44,9 @@ pub enum TabTarget {
     Local {
         #[serde(default)]
         shell: Option<String>,
+        /// Folder the tab's shell starts in (checked against `local.allowed_roots` on open).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
     Remote {
         profile: String,
@@ -81,8 +84,13 @@ impl Workspace {
                 return Err("invalid session id".into());
             }
             match &t.target {
-                TabTarget::Local { shell: Some(s) } if s.len() > 256 || !s.starts_with('/') => {
+                TabTarget::Local { shell: Some(s), .. } if s.len() > 256 || !s.starts_with('/') => {
                     return Err("invalid shell".into());
+                }
+                TabTarget::Local { cwd: Some(c), .. }
+                    if c.len() > 1024 || !c.starts_with('/') || c.chars().any(char::is_control) =>
+                {
+                    return Err("invalid folder".into());
                 }
                 TabTarget::Remote { profile } if !crate::ssh::valid_profile_id(profile) => {
                     return Err("invalid profile".into());
@@ -164,7 +172,7 @@ mod tests {
     fn tab(id: &str) -> Tab {
         Tab {
             id: id.into(),
-            target: TabTarget::Local { shell: None },
+            target: TabTarget::Local { shell: None, cwd: None },
             name: None,
             session_id: None,
         }
@@ -226,6 +234,17 @@ mod tests {
                 tabs: vec![Tab {
                     target: TabTarget::Local {
                         shell: Some("zsh".into()),
+                        cwd: None,
+                    },
+                    ..tab("a")
+                }],
+                active: None,
+            },
+            Workspace {
+                tabs: vec![Tab {
+                    target: TabTarget::Local {
+                        shell: None,
+                        cwd: Some("relative/dir".into()),
                     },
                     ..tab("a")
                 }],

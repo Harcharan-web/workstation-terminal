@@ -101,6 +101,33 @@ pub fn local_shell_spec(
     })
 }
 
+/// A shell for an OpsAPI task: started in `cwd` with `extra_env`. With an agent command line
+/// (from the gateway's config, never from a link), the shell runs it first and then becomes an
+/// ordinary interactive shell in the same folder. `-i` makes the user's rc files set PATH etc.
+/// exactly as in a normal terminal; the task text is only reachable through `extra_env`.
+pub fn task_shell_spec(
+    cfg: &Config,
+    cwd: std::path::PathBuf,
+    extra_env: Vec<(String, String)>,
+    run: Option<&str>,
+    cols: u16,
+    rows: u16,
+) -> Result<PtySpec, String> {
+    let mut spec = local_shell_spec(cfg, None, cols, rows)?;
+    spec.cwd = cwd;
+    spec.env.extend(extra_env);
+    if let Some(run) = run {
+        let shell = spec.program.to_string_lossy().into_owned();
+        let login = if cfg.local.login_shell { " -l" } else { "" };
+        // Newline, not `;`, so a `# comment` in the run line can't swallow the exec.
+        spec.args.push(OsString::from("-i"));
+        spec.args.push(OsString::from("-c"));
+        spec.args
+            .push(OsString::from(format!("{run}\nexec '{shell}'{login}")));
+    }
+    Ok(spec)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitInfo {
     pub code: Option<u32>,

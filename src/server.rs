@@ -40,6 +40,8 @@ pub struct AppState {
     pub shutdown: CancellationToken,
     pub ws_slots: Arc<Semaphore>,
     pub workspaces: crate::workspace::WorkspaceStore,
+    /// OpsAPI task links accepted by `POST /api/launch`.
+    pub launches: crate::opsapi::LaunchStore,
     pub ready: AtomicBool,
 }
 
@@ -59,6 +61,7 @@ impl AppState {
                 cfg.server.state_dir.join("workspaces"),
             ),
             shutdown: CancellationToken::new(),
+            launches: crate::opsapi::LaunchStore::default(),
             ready: AtomicBool::new(false),
             cfg,
             audit,
@@ -546,6 +549,109 @@ async fn close_session(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchReq {
+    ticket: String,
+}
+
+/// Accept an OpsAPI task link for the signed-in user (see `crate::opsapi`). The browser then
+/// opens a tab with `{"type":"open", "launch": <id>}`. A link never signs anyone in.
+async fn accept_launch(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<LaunchReq>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    use crate::opsapi::{FolderError, LinkError};
+    let (_, login) = require_login(&app, &headers)?;
+    let Json(req) = body?;
+    let ip = client_ip(&app.cfg, peer, &headers).to_string();
+    let deny = |status: StatusCode, code: &'static str, message: String| {
+        app.audit.log(
+            AuditEvent::new("launch_denied")
+                .ip(&ip)
+                .user(&login.user)
+                .field("reason", code),
+        );
+        ApiError::new(status, code, message)
+    };
+    if !(app.cfg.local.enabled && login.access.local) {
+        return Err(deny(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "your key doesn't allow terminals on this machine".into(),
+        ));
+    }
+    let cfg = &app.cfg;
+    let now = crate::opsapi::unix_now();
+    let secret = cfg.opsapi.webhook_secret.as_deref().unwrap_or("");
+    let launch = crate::opsapi::verify_ticket(secret, &req.ticket, now).map_err(|e| {
+        let code = match e {
+            LinkError::Expired => "expired",
+            LinkError::NotConfigured => "not_configured",
+            LinkError::Invalid => "invalid_link",
+        };
+        deny(StatusCode::BAD_REQUEST, code, e.to_string())
+    })?;
+    let cwd = crate::opsapi::resolve_folder(&cfg.local.allowed_roots, &launch.path).map_err(|e| {
+        let code = match e {
+            FolderError::NoRoots => "not_configured",
+            FolderError::NotFound(_) => "folder_not_found",
+            FolderError::NotAllowed(_) => "folder_not_allowed",
+        };
+        deny(StatusCode::BAD_REQUEST, code, e.to_string())
+    })?;
+    let agent = crate::opsapi::find_agent(&cfg.opsapi, &launch.agent)
+        .map_err(|m| deny(StatusCode::BAD_REQUEST, "unknown_agent", m))?
+        .cloned();
+    let pending = crate::opsapi::Pending {
+        user: login.user.clone(),
+        launch,
+        cwd,
+        agent,
+        session_id: None,
+    };
+    let p = app.launches.accept(pending, now).map_err(|e| {
+        deny(StatusCode::CONFLICT, "already_used", e.to_string())
+    })?;
+    // A reload of the same link re-attaches the session it opened, if it is still running.
+    let used = p.session_id.as_deref().is_some_and(|s| !s.is_empty());
+    let live = p
+        .session_id
+        .as_deref()
+        .filter(|sid| !sid.is_empty())
+        .and_then(|sid| app.sessions.get(sid))
+        .filter(|s| s.user == login.user && !s.is_closed())
+        .map(|s| s.id.clone());
+    let l = &p.launch;
+    app.audit.log(
+        AuditEvent::new("launch_accepted")
+            .ip(&ip)
+            .user(&login.user)
+            .field("opsapi_launch", &l.id)
+            .field("opsapi_task", &l.task)
+            .field("cwd", &p.cwd.to_string_lossy())
+            .field("agent", &l.agent),
+    );
+    Ok(Json(json!({
+        "launch": l.id,
+        "name": l.tab_name(),
+        "cwd": p.cwd,
+        "agent": {
+            "id": l.agent,
+            "name": p.agent.as_ref().map(|a| a.name.clone().unwrap_or_else(|| a.id.clone()))
+                .unwrap_or_else(|| "Terminal".into()),
+        },
+        "task": {"uuid": l.task, "number": l.num, "title": l.title, "url": l.return_url},
+        "by": l.by,
+        "workspace": l.workspace,
+        "used": used,
+        "session_id": live,
+    }))
+    .into_response())
+}
+
 async fn get_workspace(State(app): State<App>, headers: HeaderMap) -> Result<Response, ApiError> {
     let (_, login) = require_login(&app, &headers)?;
     Ok(Json(app.workspaces.load(&login.user)).into_response())
@@ -592,6 +698,7 @@ pub fn router(app: App) -> Router {
         .route("/api/me", get(me))
         .route("/api/sessions", get(list_sessions))
         .route("/api/workspace", get(get_workspace).put(put_workspace))
+        .route("/api/launch", post(accept_launch))
         .route(
             "/api/sessions/{id}",
             delete(close_session).patch(rename_session),
