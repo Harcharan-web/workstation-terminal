@@ -483,7 +483,9 @@
       if (spec.id === ws.active) toActivate = t;
     }
     restoring = false;
-    activate(toActivate || tabs[0] || null);
+    // A task link is waiting: its tab opens next, so don't start a restored tab's shell for nothing.
+    if (launchTicket && !launchHandled) updateChrome();
+    else activate(toActivate || tabs[0] || null);
     if (tabs.length) toast("Restored " + tabs.length + " tab" + (tabs.length > 1 ? "s" : ""), "ok");
   }
 
