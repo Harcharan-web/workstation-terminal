@@ -83,7 +83,7 @@ struct Claims {
     prompt: String,
     #[serde(default)]
     by: String,
-    #[serde(rename = "return")]
+    #[serde(rename = "return", default)]
     return_url: String,
     #[serde(default)]
     ws: Option<String>,
@@ -152,7 +152,7 @@ pub fn verify_ticket(secret: &str, ticket: &str, now: u64) -> Result<Launch, Lin
     bad(valid_uuidish(&c.id) && valid_uuidish(&c.task))?;
     bad(valid_agent_id(&c.agent))?;
     bad(c.path.starts_with('/') && c.path.len() <= 1024 && !c.path.chars().any(char::is_control))?;
-    bad(valid_return_url(&c.return_url))?;
+    bad(c.return_url.is_empty() || valid_return_url(&c.return_url))?;
     bad(c.prompt.chars().count() <= MAX_PROMPT_CHARS)?;
     let title = one_line(&c.title, 200).ok_or(LinkError::Invalid)?;
     let by = one_line(&c.by, 120).ok_or(LinkError::Invalid)?;
@@ -469,6 +469,15 @@ pub mod tests {
         future["exp"] = json!(now + 3500);
         assert_eq!(verify_ticket(SECRET, &mint(SECRET, future), now), Err(LinkError::Invalid));
         assert_eq!(verify_ticket("", &t, now), Err(LinkError::NotConfigured));
+    }
+
+    #[test]
+    fn return_link_is_optional() {
+        let now = 1_800_000_000;
+        let mut c = claims(now, "/srv/x");
+        c.as_object_mut().unwrap().remove("return");
+        let l = verify_ticket(SECRET, &mint(SECRET, c), now).unwrap();
+        assert_eq!(l.return_url, "");
     }
 
     #[test]
