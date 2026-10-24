@@ -391,30 +391,74 @@ impl Conn {
                 cols,
                 rows,
                 name,
-                opsapi_task,
+                launch,
             } => {
                 if self.session.is_some() {
                     return self.protocol_error("this connection already has a session", out);
                 }
-                let built = match target {
-                    OpenTarget::Local { shell } => {
-                        if !app.cfg.local.enabled || !login.access.local {
-                            Err("local terminal access is not permitted".to_string())
-                        } else {
-                            let shell = shell.as_deref().map(std::path::Path::new);
-                            crate::terminal::local_shell_spec(&app.cfg, shell, cols, rows).map(
-                                |spec| {
+                let local_ok = app.cfg.local.enabled && login.access.local;
+                // A launch decides the folder, agent and task; nothing in this message can.
+                let mut claimed: Option<crate::opsapi::Pending> = None;
+                let built = match (launch, target) {
+                    (Some(_), _) if !local_ok => {
+                        Err("local terminal access is not permitted".to_string())
+                    }
+                    (Some(id), OpenTarget::Local { .. }) => {
+                        match app.launches.take_for_open(&id, &login.user) {
+                            None => Err("this task link was already used or has expired; \
+                                         open it again from OpsAPI"
+                                .to_string()),
+                            Some(p) => {
+                                let run = p.agent.as_ref().map(|a| a.run.clone());
+                                let spec = crate::terminal::task_shell_spec(
+                                    &app.cfg,
+                                    p.cwd.clone(),
+                                    crate::opsapi::launch_env(&p.launch),
+                                    run.as_deref(),
+                                    cols,
+                                    rows,
+                                );
+                                if spec.is_err() {
+                                    app.launches.release(&p.launch.id);
+                                }
+                                claimed = Some(p);
+                                spec.map(|spec| {
                                     (
                                         Target::Local {
                                             shell: spec.program.clone(),
                                         },
                                         spec,
                                     )
+                                })
+                            }
+                        }
+                    }
+                    (Some(_), _) => Err("a task link opens a local terminal".to_string()),
+                    (None, OpenTarget::Local { shell, cwd }) => {
+                        if !local_ok {
+                            Err("local terminal access is not permitted".to_string())
+                        } else {
+                            let shell = shell.as_deref().map(std::path::Path::new);
+                            crate::terminal::local_shell_spec(&app.cfg, shell, cols, rows).and_then(
+                                |mut spec| {
+                                    if let Some(c) = cwd {
+                                        spec.cwd = crate::opsapi::resolve_folder(
+                                            &app.cfg.local.allowed_roots,
+                                            &c,
+                                        )
+                                        .map_err(|e| e.to_string())?;
+                                    }
+                                    Ok((
+                                        Target::Local {
+                                            shell: spec.program.clone(),
+                                        },
+                                        spec,
+                                    ))
                                 },
                             )
                         }
                     }
-                    OpenTarget::Remote { profile } => {
+                    (None, OpenTarget::Remote { profile }) => {
                         crate::ssh::resolve_profile(&app.cfg, &login.access, &profile)
                             .map_err(|e| e.to_string())
                             .map(|t| {
@@ -422,7 +466,7 @@ impl Conn {
                                 (Target::Remote(t), spec)
                             })
                     }
-                    OpenTarget::Adhoc { host, port, user } => {
+                    (None, OpenTarget::Adhoc { host, port, user }) => {
                         crate::ssh::resolve_adhoc(&app.cfg, &login.access, &host, port, &user)
                             .map_err(|e| e.to_string())
                             .map(|t| {
@@ -444,10 +488,18 @@ impl Conn {
                         return Flow::Continue;
                     }
                 };
-                let name = name.and_then(|n| crate::session::normalize_name(&n).ok().flatten());
-                let opsapi_task = opsapi_task.filter(|t| !t.is_empty());
-                match app.sessions.open(&login, target, spec, name, opsapi_task) {
+                let name = name
+                    .and_then(|n| crate::session::normalize_name(&n).ok().flatten())
+                    .or_else(|| claimed.as_ref().map(|p| p.launch.tab_name()));
+                let tag = claimed.as_ref().map(|p| crate::opsapi::LaunchTag {
+                    id: p.launch.id.clone(),
+                    task: p.launch.task.clone(),
+                });
+                match app.sessions.open(&login, target, spec, name, tag) {
                     Ok(s) => {
+                        if let Some(p) = &claimed {
+                            app.launches.mark_used(&p.launch.id, &s.id);
+                        }
                         let (rx, _) = app.sessions.attach(&s, self.id);
                         out.push(text(ServerMsg::SessionOpened {
                             session_id: s.id.clone(),
@@ -459,7 +511,12 @@ impl Conn {
                         self.session = Some(s);
                         self.events = Some(rx);
                     }
-                    Err(e) => out.push(text(ServerMsg::error("open_failed", e.to_string(), false))),
+                    Err(e) => {
+                        if let Some(p) = &claimed {
+                            app.launches.release(&p.launch.id);
+                        }
+                        out.push(text(ServerMsg::error("open_failed", e.to_string(), false)))
+                    }
                 }
                 Flow::Continue
             }

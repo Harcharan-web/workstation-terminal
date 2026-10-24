@@ -23,7 +23,7 @@ pub struct Config {
     pub audit: AuditConfig,
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
-    /// Optional OpsAPI task bridge (webhook when a session carries `opsapi_task`).
+    /// Optional OpsAPI task bridge: launch links from task pages, and a webhook when they start/end.
     pub opsapi: OpsapiConfig,
 }
 
@@ -32,8 +32,27 @@ pub struct Config {
 pub struct OpsapiConfig {
     /// e.g. https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal/webhook
     pub webhook_url: Option<String>,
-    /// Shared secret; OpsAPI verifies `X-Opsapi-Signature: sha256=<hmac-hex>`.
+    /// Secret shared with OpsAPI (it generates it). Verifies launch links and signs webhooks
+    /// (`X-Opsapi-Signature: sha256=<hmac-hex>`). Launch links need it and `local.allowed_roots`.
     pub webhook_secret: Option<String>,
+    /// Agents a launch link may start, by id. The link names an id; the command line is only
+    /// ever taken from here. `shell` (no agent) is always available.
+    pub agents: Vec<AgentConfig>,
+    /// Task sessions close after this long with neither input nor output. 0 disables.
+    pub idle_timeout_secs: u64,
+    /// Task sessions keep running this long after their browser disconnects.
+    pub detach_grace_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Shell command line run in the task folder, e.g. `claude "$OPSAPI_TASK_PROMPT"`.
+    /// The task text is only available through the OPSAPI_* environment variables.
+    pub run: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +106,9 @@ pub struct LocalConfig {
     pub login_shell: bool,
     /// Working directory; defaults to $HOME.
     pub working_dir: Option<PathBuf>,
+    /// Folders a tab may be opened in (and their subfolders), e.g. `~/projects`. Empty: tabs
+    /// always start in `working_dir` and launch links are refused.
+    pub allowed_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +242,9 @@ impl Default for OpsapiConfig {
         Self {
             webhook_url: None,
             webhook_secret: None,
+            agents: Vec::new(),
+            idle_timeout_secs: 4 * 3600,
+            detach_grace_secs: 4 * 3600,
         }
     }
 }
@@ -262,6 +287,7 @@ impl Default for LocalConfig {
             ],
             login_shell: true,
             working_dir: None,
+            allowed_roots: Vec::new(),
         }
     }
 }
@@ -463,6 +489,9 @@ impl Config {
         if let Some(p) = self.local.working_dir.as_mut() {
             r(p);
         }
+        for p in &mut self.local.allowed_roots {
+            r(p);
+        }
         for prof in &mut self.remote.profiles {
             if let Some(p) = prof.identity_file.as_mut() {
                 r(p);
@@ -603,6 +632,49 @@ impl Config {
                     .into(),
             );
         }
+        let o = &self.opsapi;
+        if let Some(sec) = &o.webhook_secret
+            && sec.len() < 32
+        {
+            errs.push(
+                "opsapi.webhook_secret must be at least 32 characters (paste the one OpsAPI generated)"
+                    .into(),
+            );
+        }
+        if let Some(u) = &o.webhook_url
+            && !(u.starts_with("https://") || u.starts_with("http://"))
+        {
+            errs.push("opsapi.webhook_url must be an http(s) URL".into());
+        }
+        let mut agent_ids = std::collections::HashSet::new();
+        for a in &o.agents {
+            if !crate::opsapi::valid_agent_id(&a.id) || a.id == "shell" {
+                errs.push(format!(
+                    "opsapi.agents id {:?} must match [a-z0-9_-]{{1,32}} and not be \"shell\"",
+                    a.id
+                ));
+            }
+            if !agent_ids.insert(a.id.clone()) {
+                errs.push(format!("duplicate opsapi agent id {:?}", a.id));
+            }
+            if a.run.trim().is_empty() || a.run.len() > 1024 || a.run.chars().any(|c| c.is_control())
+            {
+                errs.push(format!(
+                    "opsapi agent {:?}: run must be one line of at most 1024 characters",
+                    a.id
+                ));
+            }
+        }
+        for r in &self.local.allowed_roots {
+            if !r.is_absolute() {
+                errs.push(format!("local.allowed_roots entry {} must be absolute", r.display()));
+            }
+        }
+        for sh in &self.local.allowed_shells {
+            if sh.to_string_lossy().contains(['\'', '"', '\\']) {
+                errs.push(format!("local.allowed_shells: {} must not contain quotes", sh.display()));
+            }
+        }
         let ss = &self.sessions;
         if ss.max_total == 0 || ss.max_per_user == 0 {
             errs.push("sessions.max_total and sessions.max_per_user must be positive".into());
@@ -673,6 +745,11 @@ impl Config {
                         sh.display()
                     ));
                 }
+            }
+        }
+        for r in &self.local.allowed_roots {
+            if !r.is_dir() {
+                errs.push(format!("local.allowed_roots: {} is not a folder", r.display()));
             }
         }
         if self.remote.enabled {

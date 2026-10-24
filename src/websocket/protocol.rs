@@ -28,9 +28,10 @@ pub enum ClientMsg {
         /// Initial session name (e.g. the restored tab's name).
         #[serde(default)]
         name: Option<String>,
-        /// OpsAPI kanban task uuid when launched from a task deep-link.
+        /// Id of a launch accepted by `POST /api/launch` (OpsAPI task link). The folder, agent
+        /// and task come from the verified launch, never from this message.
         #[serde(default)]
-        opsapi_task: Option<String>,
+        launch: Option<String>,
     },
     Attach {
         session_id: String,
@@ -61,6 +62,9 @@ pub enum OpenTarget {
     Local {
         #[serde(default)]
         shell: Option<String>,
+        /// Start in this folder; it must be inside `local.allowed_roots`.
+        #[serde(default)]
+        cwd: Option<String>,
     },
     Remote {
         profile: String,
@@ -183,7 +187,7 @@ fn validate(m: &ClientMsg) -> Result<(), DecodeError> {
             rows,
             target,
             name,
-            opsapi_task,
+            launch,
         } => {
             if !size_ok(*cols, *rows) {
                 return Err(DecodeError::Invalid("size"));
@@ -194,18 +198,19 @@ fn validate(m: &ClientMsg) -> Result<(), DecodeError> {
             {
                 return Err(DecodeError::Invalid("name"));
             }
-            if opsapi_task.as_deref().is_some_and(|t| {
-                t.is_empty()
-                    || t.len() > 64
-                    || !t
-                        .chars()
-                        .all(|c| c.is_ascii_hexdigit() || c == '-')
+            if launch.as_deref().is_some_and(|t| {
+                t.is_empty() || t.len() > 64 || !t.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
             }) {
-                return Err(DecodeError::Invalid("opsapi_task"));
+                return Err(DecodeError::Invalid("launch"));
             }
             match target {
-                OpenTarget::Local { shell: Some(s) } if s.len() > 256 => {
+                OpenTarget::Local { shell: Some(s), .. } if s.len() > 256 => {
                     Err(DecodeError::Invalid("shell"))
+                }
+                OpenTarget::Local { cwd: Some(c), .. }
+                    if c.len() > 1024 || !c.starts_with('/') || c.chars().any(char::is_control) =>
+                {
+                    Err(DecodeError::Invalid("cwd"))
                 }
                 OpenTarget::Remote { profile } if !crate::ssh::valid_profile_id(profile) => {
                     Err(DecodeError::Invalid("profile"))
@@ -280,7 +285,7 @@ mod tests {
             )
             .unwrap(),
             ClientMsg::Open {
-                target: OpenTarget::Local { shell: None },
+                target: OpenTarget::Local { shell: None, cwd: None },
                 ..
             }
         ));

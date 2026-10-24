@@ -11,17 +11,23 @@
   const PROTOCOL_VERSION = 1;
   const $ = (id) => document.getElementById(id);
   const prefs = loadPrefs();
-  // Deep-link context from OpsAPI task manager (?opsapi_task=&repo=&return=).
-  const launchCtx = (function () {
-    try {
-      const q = new URLSearchParams(location.search);
-      const task = q.get("opsapi_task") || "";
-      const repo = q.get("repo") || "";
-      const ret = q.get("return") || "";
-      if (!task && !repo && !ret) return null;
-      return { opsapi_task: task || null, repo: repo || null, return_url: ret || null };
-    } catch (_) { return null; }
+  // OpsAPI task link: https://<this gateway>/#launch=<ticket>. The fragment never reaches
+  // proxies or logs. The server verifies the ticket after the user signs in with their key;
+  // until then it is only used to say which task is waiting (display only, as text).
+  const launchTicket = (function () {
+    const m = /(?:^#|&)launch=([^&]+)/.exec(location.hash || "");
+    if (!m) return null;
+    try { return decodeURIComponent(m[1]); } catch (_) { return null; }
   })();
+  let launchHandled = false;
+  function launchPreview() {
+    try {
+      const b64 = launchTicket.split(".")[0].replace(/-/g, "+").replace(/_/g, "/");
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const c = JSON.parse(new TextDecoder().decode(bytes));
+      return { number: c.num, title: String(c.title || "") };
+    } catch (_) { return null; }
+  }
 
   // ---------- small utilities ----------
   function loadPrefs() {
@@ -98,7 +104,7 @@
   class Tab {
     constructor(spec) {
       this.id = spec.id || newId();
-      this.target = spec.target;         // {kind:"local", shell?} | {kind:"remote", profile}
+      this.target = spec.target;         // {kind:"local", shell?, cwd?} | {kind:"remote", profile}
       this.name = spec.name || null;     // user label
       this.sessionId = spec.session_id || null; // session to attach to / currently bound
       this.title = this.defaultTitle();  // server title once known
@@ -110,6 +116,8 @@
       this.pending = null;
       this.started = false;              // has this tab tried to connect yet?
       this.restartNote = false;          // print "new session" note on next open
+      this.launch = spec.launch || null; // OpsAPI launch id for the first open only
+      this.task = spec.task || null;     // OpsAPI task shown in the banner (this page only)
       this.state = { text: "Not connected", kind: "" };
 
       this.el = document.createElement("div");
@@ -272,13 +280,14 @@
           } else if (this.pending && this.pending.open) {
             const msg = { type: "open", target: this.pending.open, cols: this.term.cols, rows: this.term.rows };
             if (this.name) msg.name = this.name;
-            if (launchCtx && launchCtx.opsapi_task) msg.opsapi_task = launchCtx.opsapi_task;
+            if (this.launch) msg.launch = this.launch;
             this.send(msg);
           }
           break;
         case "session_opened": {
           const resumed = m.resumed;
           this.pending = null;
+          this.launch = null; // used: later reconnects attach or open a plain shell here
           this.retries = 0;
           this.live = true;
           const changed = this.sessionId !== m.session_id;
@@ -334,6 +343,7 @@
           }
           if (this.pending && (m.code === "open_failed" || m.code === "forbidden")) {
             this.pending = null;
+            this.launch = null;
             this.disconnectSocket();
             this.setState("Could not open: " + m.message, "err");
             this.term.write("\r\n\x1b[31m" + m.message + "\x1b[0m\r\n");
@@ -355,6 +365,30 @@
     else setStatus(me ? "Signed in — open a tab" : "Not signed in", "");
     for (const id of ["btn-rename", "btn-clear", "btn-reconnect", "btn-detach", "btn-close"]) $(id).disabled = !t;
     $("empty").classList.toggle("hidden", tabs.length > 0 || !me);
+    renderTaskBanner(t);
+  }
+
+  // Built with textContent and createElement only: nothing from a link is parsed as HTML.
+  function renderTaskBanner(t) {
+    const el = $("opsapi-banner");
+    if (!el) return;
+    el.textContent = "";
+    const task = t && t.task;
+    el.classList.toggle("hidden", !task);
+    if (!task) return;
+    const parts = [];
+    parts.push("OpsAPI task " + (task.number ? "#" + task.number + " " : "") + task.title);
+    if (task.agent) parts.push(task.agent + " in " + task.cwd);
+    if (task.by) parts.push("opened by " + task.by);
+    el.append(parts.join(" · "));
+    if (/^https?:\/\//.test(task.url || "")) {
+      const a = document.createElement("a");
+      a.href = task.url;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.textContent = "Back to task";
+      el.append(" · ", a);
+    }
   }
 
   function activate(tab) {
@@ -449,7 +483,9 @@
       if (spec.id === ws.active) toActivate = t;
     }
     restoring = false;
-    activate(toActivate || tabs[0] || null);
+    // A task link is waiting: its tab opens next, so don't start a restored tab's shell for nothing.
+    if (launchTicket && !launchHandled) updateChrome();
+    else activate(toActivate || tabs[0] || null);
     if (tabs.length) toast("Restored " + tabs.length + " tab" + (tabs.length > 1 ? "s" : ""), "ok");
   }
 
@@ -655,6 +691,11 @@
     updateChrome();
     setStatus("Not signed in", "");
     $("login-error").textContent = msg || "";
+    const waiting = launchTicket && !launchHandled ? launchPreview() : null;
+    $("login-launch").textContent = waiting
+      ? "Sign in to start work on " + (waiting.number ? "#" + waiting.number + " " : "") + waiting.title + "."
+      : "";
+    $("login-launch").classList.toggle("hidden", !waiting);
     $("challenge-step").classList.add("hidden");
     $("login-user").focus();
   }
@@ -731,27 +772,41 @@
     show("term");
     updateChrome();
     await restoreWorkspace();
+    if (launchTicket && !launchHandled) await openLaunch();
     refreshSessions();
   }
 
-  function showOpsapiBanner() {
-    const el = $("opsapi-banner");
-    if (!el || !launchCtx) return;
-    const parts = [];
-    if (launchCtx.opsapi_task) parts.push("OpsAPI task " + launchCtx.opsapi_task.slice(0, 8) + "…");
-    if (launchCtx.repo) {
-      parts.push('<a href="' + launchCtx.repo.replace(/"/g, "&quot;") + '" target="_blank" rel="noreferrer">repo</a>');
+  /** Open the tab an OpsAPI task link asks for (after sign-in; the server checks everything). */
+  async function openLaunch() {
+    launchHandled = true;
+    history.replaceState(null, "", location.pathname + location.search);
+    let r;
+    try {
+      r = await api("POST", "/api/launch", { ticket: launchTicket });
+    } catch (e) {
+      toast("Couldn't open the task: " + e.message, "error");
+      return;
     }
-    if (launchCtx.return_url) {
-      parts.push('<a href="' + launchCtx.return_url.replace(/"/g, "&quot;") + '" target="_blank" rel="noreferrer">back to task</a>');
+    const task = {
+      number: r.task.number, title: r.task.title, url: r.task.url,
+      by: r.by, agent: r.agent.name, cwd: r.cwd,
+    };
+    const target = { kind: "local", cwd: r.cwd };
+    if (r.session_id) { // reload of a link that already opened a running session
+      const t = tabs.find((x) => x.sessionId === r.session_id);
+      if (t) { t.task = task; activate(t); return; }
+      addTab({ target, name: r.name, session_id: r.session_id, task }, true);
+      return;
     }
-    if (!parts.length) return;
-    el.innerHTML = "Working from OpsAPI — " + parts.join(" · ");
-    el.classList.remove("hidden");
+    if (r.used) {
+      toast("This task link was already used, so the agent isn't started again. Opening the folder.", "");
+      addTab({ target, name: r.name, task }, true);
+      return;
+    }
+    addTab({ target, name: r.name, launch: r.launch, task }, true);
   }
 
   // ---------- init ----------
-  showOpsapiBanner();
   $("set-theme").value = prefs.theme;
   $("set-font").value = prefs.fontSize;
   $("set-meta").checked = !!prefs.optionMeta;
