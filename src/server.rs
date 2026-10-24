@@ -594,14 +594,15 @@ async fn accept_launch(
         };
         deny(StatusCode::BAD_REQUEST, code, e.to_string())
     })?;
-    let cwd = crate::opsapi::resolve_folder(&cfg.local.allowed_roots, &launch.path).map_err(|e| {
-        let code = match e {
-            FolderError::NoRoots => "not_configured",
-            FolderError::NotFound(_) => "folder_not_found",
-            FolderError::NotAllowed(_) => "folder_not_allowed",
-        };
-        deny(StatusCode::BAD_REQUEST, code, e.to_string())
-    })?;
+    let cwd =
+        crate::opsapi::resolve_folder(&cfg.local.allowed_roots, &launch.path).map_err(|e| {
+            let code = match e {
+                FolderError::NoRoots => "not_configured",
+                FolderError::NotFound(_) => "folder_not_found",
+                FolderError::NotAllowed(_) => "folder_not_allowed",
+            };
+            deny(StatusCode::BAD_REQUEST, code, e.to_string())
+        })?;
     let agent = crate::opsapi::find_agent(&cfg.opsapi, &launch.agent)
         .map_err(|m| deny(StatusCode::BAD_REQUEST, "unknown_agent", m))?
         .cloned();
@@ -612,9 +613,10 @@ async fn accept_launch(
         agent,
         session_id: None,
     };
-    let p = app.launches.accept(pending, now).map_err(|e| {
-        deny(StatusCode::CONFLICT, "already_used", e.to_string())
-    })?;
+    let p = app
+        .launches
+        .accept(pending, now)
+        .map_err(|e| deny(StatusCode::CONFLICT, "already_used", e.to_string()))?;
     // A reload of the same link re-attaches the session it opened, if it is still running.
     let used = p.session_id.as_deref().is_some_and(|s| !s.is_empty());
     let live = p

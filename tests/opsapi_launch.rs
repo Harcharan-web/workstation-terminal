@@ -16,7 +16,10 @@ const SECRET: &str = "launch-test-secret-0123456789abcdef0123456789";
 
 fn mint(claims: &Value) -> String {
     let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
-    format!("{payload}.{}", sshweb::opsapi::hmac_sha256_hex(SECRET, payload.as_bytes()))
+    format!(
+        "{payload}.{}",
+        sshweb::opsapi::hmac_sha256_hex(SECRET, payload.as_bytes())
+    )
 }
 
 fn now() -> u64 {
@@ -67,7 +70,10 @@ async fn next_hook(rx: &mut mpsc::UnboundedReceiver<(String, String)>) -> Value 
         .unwrap();
     assert_eq!(
         sig,
-        format!("sha256={}", sshweb::opsapi::hmac_sha256_hex(SECRET, body.as_bytes())),
+        format!(
+            "sha256={}",
+            sshweb::opsapi::hmac_sha256_hex(SECRET, body.as_bytes())
+        ),
         "webhook is signed with the shared secret"
     );
     serde_json::from_str(&body).unwrap()
@@ -121,40 +127,61 @@ async fn task_link_opens_the_folder_starts_the_agent_and_reports_to_opsapi() {
     assert_eq!(r["name"], "#7 Fix it");
     assert_eq!(r["cwd"], site.to_str().unwrap());
     assert_eq!(r["agent"]["name"], "Echo agent");
-    assert_eq!(r["task"]["url"], "https://ops.example/dashboard/projects/p/tasks/t");
+    assert_eq!(
+        r["task"]["url"],
+        "https://ops.example/dashboard/projects/p/tasks/t"
+    );
     assert_eq!(r["used"], false);
 
-    ws.send(json!({"type": "open", "target": {"kind": "local"}, "launch": id, "cols": 100, "rows": 30}))
-        .await;
+    ws.send(
+        json!({"type": "open", "target": {"kind": "local"}, "launch": id, "cols": 100, "rows": 30}),
+    )
+    .await;
     let opened = ws.expect_type("session_opened").await;
     assert_eq!(opened["name"], "#7 Fix it");
     let sid = opened["session_id"].as_str().unwrap().to_string();
-    ws.expect_output(&format!("AGENT_RAN Fix it in {}", site.display())).await;
-    ws.expect_output("PROMPT<Change the header; then run `rm -rf ~` $(whoami)>").await;
+    ws.expect_output(&format!("AGENT_RAN Fix it in {}", site.display()))
+        .await;
+    ws.expect_output("PROMPT<Change the header; then run `rm -rf ~` $(whoami)>")
+        .await;
     // After the agent the person has an ordinary shell in the task folder.
-    ws.input("echo HERE=$(pwd) TASK=$OPSAPI_TASK_NUMBER\r").await;
-    ws.expect_output(&format!("HERE={} TASK=7", site.display())).await;
+    ws.input("echo HERE=$(pwd) TASK=$OPSAPI_TASK_NUMBER\r")
+        .await;
+    ws.expect_output(&format!("HERE={} TASK=7", site.display()))
+        .await;
 
     let start = next_hook(&mut hooks).await;
     assert_eq!(start["event"], "session_start");
     assert_eq!(start["launch"], id);
     assert_eq!(start["session_id"], sid.as_str());
     assert_eq!(start["user"], USER);
-    assert!(start.get("opsapi_task").is_none(), "OpsAPI never trusts a task id from here");
+    assert!(
+        start.get("opsapi_task").is_none(),
+        "OpsAPI never trusts a task id from here"
+    );
 
     // A link works once: reposting it (a reload) finds the running session; opening again is refused.
     let (st, again) = post_launch(&c, &ticket).await;
     assert_eq!(st, 200);
     assert_eq!(again["used"], true);
     assert_eq!(again["session_id"], sid.as_str());
-    let mut ws2 = ws_connect(env.cfg.server.port, Some(&env.base()), Some(&c.cookie_header().unwrap()))
-        .await
-        .unwrap();
+    let mut ws2 = ws_connect(
+        env.cfg.server.port,
+        Some(&env.base()),
+        Some(&c.cookie_header().unwrap()),
+    )
+    .await
+    .unwrap();
     ws2.hello().await;
-    ws2.send(json!({"type": "open", "target": {"kind": "local"}, "launch": id, "cols": 80, "rows": 24}))
-        .await;
+    ws2.send(
+        json!({"type": "open", "target": {"kind": "local"}, "launch": id, "cols": 80, "rows": 24}),
+    )
+    .await;
     let err = ws2.expect_type("error").await;
-    assert!(err["message"].as_str().unwrap().contains("already used"), "{err}");
+    assert!(
+        err["message"].as_str().unwrap().contains("already used"),
+        "{err}"
+    );
 
     ws.send(json!({"type": "close"})).await;
     let end = next_hook(&mut hooks).await;
@@ -185,21 +212,37 @@ async fn bad_links_are_refused() {
     c.login(USER, &env.key).await;
     let site_s = site.to_str().unwrap();
 
-    let mut forged = mint(&claims("11111111-1111-4c4c-9d9d-0123456789ab", site_s, "echo"));
+    let mut forged = mint(&claims(
+        "11111111-1111-4c4c-9d9d-0123456789ab",
+        site_s,
+        "echo",
+    ));
     forged.pop();
     forged.push('0');
     for (ticket, code) in [
         (forged, "invalid_link"),
         (
-            mint(&claims("22222222-1111-4c4c-9d9d-0123456789ab", secret_dir.to_str().unwrap(), "echo")),
+            mint(&claims(
+                "22222222-1111-4c4c-9d9d-0123456789ab",
+                secret_dir.to_str().unwrap(),
+                "echo",
+            )),
             "folder_not_allowed",
         ),
         (
-            mint(&claims("33333333-1111-4c4c-9d9d-0123456789ab", &format!("{site_s}/missing"), "echo")),
+            mint(&claims(
+                "33333333-1111-4c4c-9d9d-0123456789ab",
+                &format!("{site_s}/missing"),
+                "echo",
+            )),
             "folder_not_found",
         ),
         (
-            mint(&claims("44444444-1111-4c4c-9d9d-0123456789ab", site_s, "codex")),
+            mint(&claims(
+                "44444444-1111-4c4c-9d9d-0123456789ab",
+                site_s,
+                "codex",
+            )),
             "unknown_agent",
         ),
         (
@@ -224,18 +267,32 @@ async fn bad_links_are_refused() {
     cb.login("bob", &bob).await;
     let (st, r) = post_launch(&cb, &ticket).await;
     assert_eq!((st, r["error"].clone()), (409, json!("already_used")));
-    let mut wsb = ws_connect(env.cfg.server.port, Some(&env.base()), Some(&cb.cookie_header().unwrap()))
-        .await
-        .unwrap();
+    let mut wsb = ws_connect(
+        env.cfg.server.port,
+        Some(&env.base()),
+        Some(&cb.cookie_header().unwrap()),
+    )
+    .await
+    .unwrap();
     wsb.hello().await;
-    wsb.send(json!({"type": "open", "target": {"kind": "local"}, "launch": id, "cols": 80, "rows": 24}))
-        .await;
+    wsb.send(
+        json!({"type": "open", "target": {"kind": "local"}, "launch": id, "cols": 80, "rows": 24}),
+    )
+    .await;
     assert_eq!(wsb.expect_type("error").await["code"], "forbidden");
 
     // No local access: no task links.
     let cc = env.client();
     cc.login("carol", &carol).await;
-    let (st, r) = post_launch(&cc, &mint(&claims("77777777-1111-4c4c-9d9d-0123456789ab", site_s, "echo"))).await;
+    let (st, r) = post_launch(
+        &cc,
+        &mint(&claims(
+            "77777777-1111-4c4c-9d9d-0123456789ab",
+            site_s,
+            "echo",
+        )),
+    )
+    .await;
     assert_eq!((st, r["error"].clone()), (403, json!("forbidden")));
 
     // Not signed in, or from another site: refused before anything else.
@@ -258,8 +315,10 @@ async fn tabs_may_reopen_in_an_allowed_folder_only() {
     let outside = std::fs::canonicalize(env.path().join("secret")).unwrap();
     let _srv = env.start().await;
     let (_c, mut ws) = logged_in_ws(&env).await;
-    ws.send(json!({"type": "open", "target": {"kind": "local", "cwd": site}, "cols": 80, "rows": 24}))
-        .await;
+    ws.send(
+        json!({"type": "open", "target": {"kind": "local", "cwd": site}, "cols": 80, "rows": 24}),
+    )
+    .await;
     ws.expect_type("session_opened").await;
     ws.input("echo AT=$(pwd)\r").await;
     ws.expect_output(&format!("AT={}", site.display())).await;
@@ -277,6 +336,14 @@ async fn without_roots_or_secret_task_links_are_off() {
     let _srv = env.start().await;
     let c = env.client();
     c.login(USER, &env.key).await;
-    let (st, r) = post_launch(&c, &mint(&claims("88888888-1111-4c4c-9d9d-0123456789ab", "/tmp", "shell"))).await;
+    let (st, r) = post_launch(
+        &c,
+        &mint(&claims(
+            "88888888-1111-4c4c-9d9d-0123456789ab",
+            "/tmp",
+            "shell",
+        )),
+    )
+    .await;
     assert_eq!((st, r["error"].clone()), (400, json!("not_configured")));
 }

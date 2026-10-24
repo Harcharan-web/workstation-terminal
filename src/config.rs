@@ -657,7 +657,9 @@ impl Config {
             if !agent_ids.insert(a.id.clone()) {
                 errs.push(format!("duplicate opsapi agent id {:?}", a.id));
             }
-            if a.run.trim().is_empty() || a.run.len() > 1024 || a.run.chars().any(|c| c.is_control())
+            if a.run.trim().is_empty()
+                || a.run.len() > 1024
+                || a.run.chars().any(|c| c.is_control())
             {
                 errs.push(format!(
                     "opsapi agent {:?}: run must be one line of at most 1024 characters",
@@ -667,12 +669,18 @@ impl Config {
         }
         for r in &self.local.allowed_roots {
             if !r.is_absolute() {
-                errs.push(format!("local.allowed_roots entry {} must be absolute", r.display()));
+                errs.push(format!(
+                    "local.allowed_roots entry {} must be absolute",
+                    r.display()
+                ));
             }
         }
         for sh in &self.local.allowed_shells {
             if sh.to_string_lossy().contains(['\'', '"', '\\']) {
-                errs.push(format!("local.allowed_shells: {} must not contain quotes", sh.display()));
+                errs.push(format!(
+                    "local.allowed_shells: {} must not contain quotes",
+                    sh.display()
+                ));
             }
         }
         let ss = &self.sessions;
@@ -749,7 +757,10 @@ impl Config {
         }
         for r in &self.local.allowed_roots {
             if !r.is_dir() {
-                errs.push(format!("local.allowed_roots: {} is not a folder", r.display()));
+                errs.push(format!(
+                    "local.allowed_roots: {} is not a folder",
+                    r.display()
+                ));
             }
         }
         if self.remote.enabled {

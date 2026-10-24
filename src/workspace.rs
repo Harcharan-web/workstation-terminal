@@ -172,7 +172,10 @@ mod tests {
     fn tab(id: &str) -> Tab {
         Tab {
             id: id.into(),
-            target: TabTarget::Local { shell: None, cwd: None },
+            target: TabTarget::Local {
+                shell: None,
+                cwd: None,
+            },
             name: None,
             session_id: None,
         }

@@ -119,7 +119,9 @@ fn valid_return_url(u: &str) -> bool {
         || u.starts_with("http://127.0.0.1");
     ok_scheme
         && u.len() <= 2048
-        && !u.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '<' || c == '>')
+        && !u
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '<' || c == '>')
 }
 
 /// Verify a launch ticket's signature, lifetime and fields.
@@ -195,7 +197,8 @@ pub fn resolve_folder(roots: &[PathBuf], requested: &str) -> Result<PathBuf, Fol
     if !p.is_absolute() || requested.chars().any(char::is_control) {
         return Err(FolderError::NotAllowed(requested.to_string()));
     }
-    let real = std::fs::canonicalize(p).map_err(|_| FolderError::NotFound(requested.to_string()))?;
+    let real =
+        std::fs::canonicalize(p).map_err(|_| FolderError::NotFound(requested.to_string()))?;
     if !real.is_dir() {
         return Err(FolderError::NotFound(requested.to_string()));
     }
@@ -445,7 +448,10 @@ pub mod tests {
         let l = verify_ticket(SECRET, &mint(SECRET, claims(now, "/srv/x")), now).unwrap();
         assert_eq!(l.agent, "claude");
         assert_eq!(l.num, Some(12));
-        assert_eq!(l.prompt, "Do it\nwell[31m", "CR and ESC dropped, newline kept");
+        assert_eq!(
+            l.prompt, "Do it\nwell[31m",
+            "CR and ESC dropped, newline kept"
+        );
         assert_eq!(l.tab_name(), "#12 Fix the header");
         assert_eq!(l.workspace.as_deref(), Some("Acme"));
     }
@@ -454,20 +460,35 @@ pub mod tests {
     fn tampered_wrong_key_expired_and_long_lived_links_are_refused() {
         let now = 1_800_000_000;
         let t = mint(SECRET, claims(now, "/srv/x"));
-        assert_eq!(verify_ticket("another-secret-another-secret-xx", &t, now), Err(LinkError::Invalid));
+        assert_eq!(
+            verify_ticket("another-secret-another-secret-xx", &t, now),
+            Err(LinkError::Invalid)
+        );
         let (payload, sig) = t.rsplit_once('.').unwrap();
         let mut c = claims(now, "/srv/x");
         c["path"] = json!("/etc");
         let forged = format!("{}.{sig}", URL_SAFE_NO_PAD.encode(c.to_string()));
         assert_eq!(verify_ticket(SECRET, &forged, now), Err(LinkError::Invalid));
-        assert_eq!(verify_ticket(SECRET, &format!("{payload}.00"), now), Err(LinkError::Invalid));
-        assert_eq!(verify_ticket(SECRET, &t, now + 901), Err(LinkError::Expired));
+        assert_eq!(
+            verify_ticket(SECRET, &format!("{payload}.00"), now),
+            Err(LinkError::Invalid)
+        );
+        assert_eq!(
+            verify_ticket(SECRET, &t, now + 901),
+            Err(LinkError::Expired)
+        );
         let mut long = claims(now, "/srv/x");
         long["exp"] = json!(now + MAX_LINK_LIFETIME_SECS + 1);
-        assert_eq!(verify_ticket(SECRET, &mint(SECRET, long), now), Err(LinkError::Invalid));
+        assert_eq!(
+            verify_ticket(SECRET, &mint(SECRET, long), now),
+            Err(LinkError::Invalid)
+        );
         let mut future = claims(now + 3000, "/srv/x");
         future["exp"] = json!(now + 3500);
-        assert_eq!(verify_ticket(SECRET, &mint(SECRET, future), now), Err(LinkError::Invalid));
+        assert_eq!(
+            verify_ticket(SECRET, &mint(SECRET, future), now),
+            Err(LinkError::Invalid)
+        );
         assert_eq!(verify_ticket("", &t, now), Err(LinkError::NotConfigured));
     }
 
@@ -497,7 +518,11 @@ pub mod tests {
         ] {
             let mut c = claims(now, "/srv/x");
             c[k] = v;
-            assert_eq!(verify_ticket(SECRET, &mint(SECRET, c), now), Err(LinkError::Invalid), "{k}");
+            assert_eq!(
+                verify_ticket(SECRET, &mint(SECRET, c), now),
+                Err(LinkError::Invalid),
+                "{k}"
+            );
         }
     }
 
@@ -513,7 +538,10 @@ pub mod tests {
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
         let roots = vec![root.clone()];
         let real_site = std::fs::canonicalize(&site).unwrap();
-        assert_eq!(resolve_folder(&roots, site.to_str().unwrap()), Ok(real_site.clone()));
+        assert_eq!(
+            resolve_folder(&roots, site.to_str().unwrap()),
+            Ok(real_site.clone())
+        );
         assert_eq!(
             resolve_folder(&roots, &format!("{}/src/..", site.display())),
             Ok(real_site)
@@ -534,7 +562,10 @@ pub mod tests {
             resolve_folder(&roots, root.join("missing").to_str().unwrap()),
             Err(FolderError::NotFound(_))
         ));
-        assert!(matches!(resolve_folder(&roots, "relative"), Err(FolderError::NotAllowed(_))));
+        assert!(matches!(
+            resolve_folder(&roots, "relative"),
+            Err(FolderError::NotAllowed(_))
+        ));
         assert_eq!(resolve_folder(&[], "/tmp"), Err(FolderError::NoRoots));
     }
 
@@ -552,21 +583,49 @@ pub mod tests {
         };
         store.accept(p.clone(), now).unwrap();
         assert_eq!(
-            store.accept(Pending { user: "bob".into(), ..p.clone() }, now).err(),
+            store
+                .accept(
+                    Pending {
+                        user: "bob".into(),
+                        ..p.clone()
+                    },
+                    now
+                )
+                .err(),
             Some(ClaimError::OtherUser)
         );
         assert!(store.take_for_open(&l.id, "bob").is_none());
         assert!(store.take_for_open(&l.id, "alice").is_some());
-        assert!(store.take_for_open(&l.id, "alice").is_none(), "claimed while opening");
+        assert!(
+            store.take_for_open(&l.id, "alice").is_none(),
+            "claimed while opening"
+        );
         store.release(&l.id);
-        assert!(store.take_for_open(&l.id, "alice").is_some(), "released after a failed open");
+        assert!(
+            store.take_for_open(&l.id, "alice").is_some(),
+            "released after a failed open"
+        );
         store.mark_used(&l.id, "abc123");
         assert!(store.take_for_open(&l.id, "alice").is_none(), "used once");
         let again = store.accept(p, now).unwrap();
-        assert_eq!(again.session_id.as_deref(), Some("abc123"), "reload finds the session");
+        assert_eq!(
+            again.session_id.as_deref(),
+            Some("abc123"),
+            "reload finds the session"
+        );
         // Purged an hour after expiry.
         let later = l.exp + MAX_LINK_LIFETIME_SECS + 1;
-        store.accept(Pending { user: "carol".into(), launch: l, cwd: "/srv/x".into(), agent: None, session_id: None }, later)
+        store
+            .accept(
+                Pending {
+                    user: "carol".into(),
+                    launch: l,
+                    cwd: "/srv/x".into(),
+                    agent: None,
+                    session_id: None,
+                },
+                later,
+            )
             .unwrap();
     }
 
@@ -577,6 +636,9 @@ pub mod tests {
         let env: HashMap<_, _> = launch_env(&l).into_iter().collect();
         assert_eq!(env["OPSAPI_TASK_NUMBER"], "12");
         assert_eq!(env["OPSAPI_TASK_PROMPT"], "Do it\nwell[31m");
-        assert_eq!(env["OPSAPI_TASK_URL"], "https://ops.example/dashboard/projects/p/tasks/t");
+        assert_eq!(
+            env["OPSAPI_TASK_URL"],
+            "https://ops.example/dashboard/projects/p/tasks/t"
+        );
     }
 }
