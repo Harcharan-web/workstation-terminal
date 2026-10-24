@@ -4,7 +4,13 @@
 //!   is `base64url(json).hex(hmac_sha256(secret, base64url(json)))`. The page posts it to
 //!   `/api/launch` once the user has signed in with their SSH key; the gateway verifies it, checks the
 //!   folder against `local.allowed_roots` and the agent against `opsapi.agents`, and the next `open`
-//!   with that launch id starts a shell there. A launch link never signs anyone in.
+//!   with that launch id starts a shell there.
+//! - **Auto sign-in.** A link may also carry a `login` claim (an OpsAPI user who confirmed a step-up
+//!   code). When `opsapi.autologin` is on and maps that email to a terminal user,
+//!   `/api/launch/login` signs the person in through that user's key, once per link. Without it a
+//!   launch link never signs anyone in.
+//! - **Report.** A `report` claim gives the agent a URL and token to tell OpsAPI about its pull
+//!   request (`OPSAPI_REPORT_URL`, `OPSAPI_REPORT_TOKEN`).
 //! - **Webhook.** When a launched session starts or ends, an HMAC-signed POST tells OpsAPI.
 //!
 //! See docs/OPSAPI.md for the full contract.
@@ -20,10 +26,12 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use crate::config::{AgentConfig, Config, OpsapiConfig};
+use crate::config::{AgentConfig, AutologinConfig, Config, OpsapiConfig};
 
 /// Longest lifetime OpsAPI may give a link (it uses 15 minutes).
 pub const MAX_LINK_LIFETIME_SECS: u64 = 3600;
+/// Longest lifetime of a link that signs someone in (OpsAPI uses exactly this).
+pub const MAX_LOGIN_LINK_LIFETIME_SECS: u64 = 120;
 /// Allowed clock difference between OpsAPI and this machine.
 const CLOCK_SKEW_SECS: u64 = 300;
 const MAX_TICKET_BYTES: usize = 24 * 1024;
@@ -39,6 +47,28 @@ fn valid_uuidish(s: &str) -> bool {
     (1..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
+/// A canonical UUID: 8-4-4-4-12 hex digits.
+fn valid_uuid(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|g| g.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+fn valid_report_token(s: &str) -> bool {
+    (32..=128).contains(&s.len())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// An email as OpsAPI sends it: one line, at most 254 characters, `local@domain`.
+fn valid_email(s: &str) -> bool {
+    s.len() <= 254
+        && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+        && matches!(s.split_once('@'), Some((l, d)) if !l.is_empty() && !d.is_empty())
+}
+
 /// A verified launch link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
@@ -52,7 +82,26 @@ pub struct Launch {
     pub by: String,
     pub return_url: String,
     pub workspace: Option<String>,
+    pub iat: u64,
     pub exp: u64,
+    /// OpsAPI asks to sign this person in (§8 of the OpsAPI doc).
+    pub login: Option<LoginClaim>,
+    /// Where the agent reports its pull request.
+    pub report: Option<Report>,
+}
+
+/// The OpsAPI user a link may sign in, and when they last confirmed a step-up code.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct LoginClaim {
+    pub email: String,
+    pub user: String,
+    pub stepup: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Report {
+    pub url: String,
+    pub token: String,
 }
 
 impl Launch {
@@ -87,6 +136,12 @@ struct Claims {
     return_url: String,
     #[serde(default)]
     ws: Option<String>,
+    #[serde(default)]
+    login: Option<LoginClaim>,
+    #[serde(default)]
+    report: Option<Report>,
+    // Claims this terminal doesn't know are ignored (no deny_unknown_fields), so a newer OpsAPI
+    // works with an older terminal.
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -113,13 +168,15 @@ fn clean_prompt(s: &str) -> String {
         .collect()
 }
 
-fn valid_return_url(u: &str) -> bool {
+fn valid_url(u: &str, max: usize) -> bool {
     let ok_scheme = u.starts_with("https://")
         || u.starts_with("http://localhost")
         || u.starts_with("http://127.0.0.1");
     ok_scheme
-        && u.len() <= 2048
-        && !u.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '<' || c == '>')
+        && u.len() <= max
+        && !u
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '<' || c == '>')
 }
 
 /// Verify a launch ticket's signature, lifetime and fields.
@@ -152,7 +209,7 @@ pub fn verify_ticket(secret: &str, ticket: &str, now: u64) -> Result<Launch, Lin
     bad(valid_uuidish(&c.id) && valid_uuidish(&c.task))?;
     bad(valid_agent_id(&c.agent))?;
     bad(c.path.starts_with('/') && c.path.len() <= 1024 && !c.path.chars().any(char::is_control))?;
-    bad(c.return_url.is_empty() || valid_return_url(&c.return_url))?;
+    bad(c.return_url.is_empty() || valid_url(&c.return_url, 2048))?;
     bad(c.prompt.chars().count() <= MAX_PROMPT_CHARS)?;
     let title = one_line(&c.title, 200).ok_or(LinkError::Invalid)?;
     let by = one_line(&c.by, 120).ok_or(LinkError::Invalid)?;
@@ -160,6 +217,12 @@ pub fn verify_ticket(secret: &str, ticket: &str, now: u64) -> Result<Launch, Lin
         Some(w) => Some(one_line(&w, 120).ok_or(LinkError::Invalid)?),
         None => None,
     };
+    if let Some(l) = &c.login {
+        bad(valid_email(&l.email) && valid_uuid(&l.user))?;
+    }
+    if let Some(r) = &c.report {
+        bad(valid_url(&r.url, 512) && valid_report_token(&r.token))?;
+    }
     Ok(Launch {
         id: c.id.to_ascii_lowercase(),
         task: c.task.to_ascii_lowercase(),
@@ -171,8 +234,73 @@ pub fn verify_ticket(secret: &str, ticket: &str, now: u64) -> Result<Launch, Lin
         by,
         return_url: c.return_url,
         workspace,
+        iat: c.iat,
         exp: c.exp,
+        login: c.login.map(|l| LoginClaim {
+            user: l.user.to_ascii_lowercase(),
+            ..l
+        }),
+        report: c.report,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AutologinError {
+    #[error("{0}")]
+    Link(LinkError),
+    #[error("automatic sign-in is off on this terminal; sign in with your SSH key")]
+    Off,
+    #[error("automatic sign-in isn't set up for you on this terminal; sign in with your SSH key")]
+    NotAllowed,
+    #[error(
+        "your OpsAPI confirmation code is too old for this terminal; sign in with your SSH key"
+    )]
+    StepupStale,
+}
+
+impl AutologinError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            AutologinError::Link(e) => e.code(),
+            AutologinError::Off => "autologin_off",
+            AutologinError::NotAllowed => "autologin_not_allowed",
+            AutologinError::StepupStale => "stepup_stale",
+        }
+    }
+}
+
+impl LinkError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            LinkError::Expired => "expired",
+            LinkError::NotConfigured => "not_configured",
+            LinkError::Invalid => "invalid_link",
+        }
+    }
+}
+
+/// The terminal user a verified link may sign in (§8), before the key check: the link carries
+/// `login` and lives at most 120 s, auto sign-in is on, the email is mapped, and the step-up is
+/// no later than the link and no older than `max_stepup_age_secs`.
+pub fn autologin_user<'a>(
+    cfg: &'a AutologinConfig,
+    launch: &Launch,
+    now: u64,
+) -> Result<&'a str, AutologinError> {
+    if !cfg.enabled {
+        return Err(AutologinError::Off);
+    }
+    let login = launch.login.as_ref().ok_or(AutologinError::NotAllowed)?;
+    if launch.exp - launch.iat > MAX_LOGIN_LINK_LIFETIME_SECS || login.stepup > launch.iat {
+        return Err(AutologinError::Link(LinkError::Invalid));
+    }
+    let user = cfg
+        .user_for(&login.email)
+        .ok_or(AutologinError::NotAllowed)?;
+    if now.saturating_sub(login.stepup) > cfg.max_stepup_age_secs {
+        return Err(AutologinError::StepupStale);
+    }
+    Ok(user)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -195,7 +323,8 @@ pub fn resolve_folder(roots: &[PathBuf], requested: &str) -> Result<PathBuf, Fol
     if !p.is_absolute() || requested.chars().any(char::is_control) {
         return Err(FolderError::NotAllowed(requested.to_string()));
     }
-    let real = std::fs::canonicalize(p).map_err(|_| FolderError::NotFound(requested.to_string()))?;
+    let real =
+        std::fs::canonicalize(p).map_err(|_| FolderError::NotFound(requested.to_string()))?;
     if !real.is_dir() {
         return Err(FolderError::NotFound(requested.to_string()));
     }
@@ -250,6 +379,8 @@ pub enum ClaimError {
 #[derive(Default)]
 pub struct LaunchStore {
     map: Mutex<HashMap<String, Pending>>,
+    /// Launch ids that already signed someone in (`/api/launch/login`), with their expiry.
+    logins: Mutex<HashMap<String, u64>>,
 }
 
 impl LaunchStore {
@@ -290,6 +421,14 @@ impl LaunchStore {
         }
     }
 
+    /// Use a link to sign someone in. True the first time for each launch id; kept as long as
+    /// accepted launches (an hour past expiry, longer than any link lives).
+    pub fn claim_login(&self, launch: &Launch, now: u64) -> bool {
+        let mut used = self.logins.lock().unwrap();
+        used.retain(|_, exp| *exp + MAX_LINK_LIFETIME_SECS > now);
+        used.insert(launch.id.clone(), launch.exp).is_none()
+    }
+
     pub fn release(&self, id: &str) {
         if let Some(p) = self.map.lock().unwrap().get_mut(id)
             && p.session_id.as_deref() == Some("")
@@ -302,7 +441,7 @@ impl LaunchStore {
 /// Environment for a launched shell. The prompt reaches the agent only through these variables,
 /// so its text is never parsed as shell syntax.
 pub fn launch_env(l: &Launch) -> Vec<(String, String)> {
-    vec![
+    let mut env = vec![
         ("OPSAPI_LAUNCH".into(), l.id.clone()),
         ("OPSAPI_TASK".into(), l.task.clone()),
         (
@@ -312,7 +451,12 @@ pub fn launch_env(l: &Launch) -> Vec<(String, String)> {
         ("OPSAPI_TASK_TITLE".into(), l.title.clone()),
         ("OPSAPI_TASK_URL".into(), l.return_url.clone()),
         ("OPSAPI_TASK_PROMPT".into(), l.prompt.clone()),
-    ]
+    ];
+    if let Some(r) = &l.report {
+        env.push(("OPSAPI_REPORT_URL".into(), r.url.clone()));
+        env.push(("OPSAPI_REPORT_TOKEN".into(), r.token.clone()));
+    }
+    env
 }
 
 /// Fire-and-forget HMAC-signed POST to OpsAPI for a launched session (a few retries).
@@ -445,7 +589,10 @@ pub mod tests {
         let l = verify_ticket(SECRET, &mint(SECRET, claims(now, "/srv/x")), now).unwrap();
         assert_eq!(l.agent, "claude");
         assert_eq!(l.num, Some(12));
-        assert_eq!(l.prompt, "Do it\nwell[31m", "CR and ESC dropped, newline kept");
+        assert_eq!(
+            l.prompt, "Do it\nwell[31m",
+            "CR and ESC dropped, newline kept"
+        );
         assert_eq!(l.tab_name(), "#12 Fix the header");
         assert_eq!(l.workspace.as_deref(), Some("Acme"));
     }
@@ -454,20 +601,35 @@ pub mod tests {
     fn tampered_wrong_key_expired_and_long_lived_links_are_refused() {
         let now = 1_800_000_000;
         let t = mint(SECRET, claims(now, "/srv/x"));
-        assert_eq!(verify_ticket("another-secret-another-secret-xx", &t, now), Err(LinkError::Invalid));
+        assert_eq!(
+            verify_ticket("another-secret-another-secret-xx", &t, now),
+            Err(LinkError::Invalid)
+        );
         let (payload, sig) = t.rsplit_once('.').unwrap();
         let mut c = claims(now, "/srv/x");
         c["path"] = json!("/etc");
         let forged = format!("{}.{sig}", URL_SAFE_NO_PAD.encode(c.to_string()));
         assert_eq!(verify_ticket(SECRET, &forged, now), Err(LinkError::Invalid));
-        assert_eq!(verify_ticket(SECRET, &format!("{payload}.00"), now), Err(LinkError::Invalid));
-        assert_eq!(verify_ticket(SECRET, &t, now + 901), Err(LinkError::Expired));
+        assert_eq!(
+            verify_ticket(SECRET, &format!("{payload}.00"), now),
+            Err(LinkError::Invalid)
+        );
+        assert_eq!(
+            verify_ticket(SECRET, &t, now + 901),
+            Err(LinkError::Expired)
+        );
         let mut long = claims(now, "/srv/x");
         long["exp"] = json!(now + MAX_LINK_LIFETIME_SECS + 1);
-        assert_eq!(verify_ticket(SECRET, &mint(SECRET, long), now), Err(LinkError::Invalid));
+        assert_eq!(
+            verify_ticket(SECRET, &mint(SECRET, long), now),
+            Err(LinkError::Invalid)
+        );
         let mut future = claims(now + 3000, "/srv/x");
         future["exp"] = json!(now + 3500);
-        assert_eq!(verify_ticket(SECRET, &mint(SECRET, future), now), Err(LinkError::Invalid));
+        assert_eq!(
+            verify_ticket(SECRET, &mint(SECRET, future), now),
+            Err(LinkError::Invalid)
+        );
         assert_eq!(verify_ticket("", &t, now), Err(LinkError::NotConfigured));
     }
 
@@ -497,7 +659,11 @@ pub mod tests {
         ] {
             let mut c = claims(now, "/srv/x");
             c[k] = v;
-            assert_eq!(verify_ticket(SECRET, &mint(SECRET, c), now), Err(LinkError::Invalid), "{k}");
+            assert_eq!(
+                verify_ticket(SECRET, &mint(SECRET, c), now),
+                Err(LinkError::Invalid),
+                "{k}"
+            );
         }
     }
 
@@ -513,7 +679,10 @@ pub mod tests {
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
         let roots = vec![root.clone()];
         let real_site = std::fs::canonicalize(&site).unwrap();
-        assert_eq!(resolve_folder(&roots, site.to_str().unwrap()), Ok(real_site.clone()));
+        assert_eq!(
+            resolve_folder(&roots, site.to_str().unwrap()),
+            Ok(real_site.clone())
+        );
         assert_eq!(
             resolve_folder(&roots, &format!("{}/src/..", site.display())),
             Ok(real_site)
@@ -534,7 +703,10 @@ pub mod tests {
             resolve_folder(&roots, root.join("missing").to_str().unwrap()),
             Err(FolderError::NotFound(_))
         ));
-        assert!(matches!(resolve_folder(&roots, "relative"), Err(FolderError::NotAllowed(_))));
+        assert!(matches!(
+            resolve_folder(&roots, "relative"),
+            Err(FolderError::NotAllowed(_))
+        ));
         assert_eq!(resolve_folder(&[], "/tmp"), Err(FolderError::NoRoots));
     }
 
@@ -552,21 +724,49 @@ pub mod tests {
         };
         store.accept(p.clone(), now).unwrap();
         assert_eq!(
-            store.accept(Pending { user: "bob".into(), ..p.clone() }, now).err(),
+            store
+                .accept(
+                    Pending {
+                        user: "bob".into(),
+                        ..p.clone()
+                    },
+                    now
+                )
+                .err(),
             Some(ClaimError::OtherUser)
         );
         assert!(store.take_for_open(&l.id, "bob").is_none());
         assert!(store.take_for_open(&l.id, "alice").is_some());
-        assert!(store.take_for_open(&l.id, "alice").is_none(), "claimed while opening");
+        assert!(
+            store.take_for_open(&l.id, "alice").is_none(),
+            "claimed while opening"
+        );
         store.release(&l.id);
-        assert!(store.take_for_open(&l.id, "alice").is_some(), "released after a failed open");
+        assert!(
+            store.take_for_open(&l.id, "alice").is_some(),
+            "released after a failed open"
+        );
         store.mark_used(&l.id, "abc123");
         assert!(store.take_for_open(&l.id, "alice").is_none(), "used once");
         let again = store.accept(p, now).unwrap();
-        assert_eq!(again.session_id.as_deref(), Some("abc123"), "reload finds the session");
+        assert_eq!(
+            again.session_id.as_deref(),
+            Some("abc123"),
+            "reload finds the session"
+        );
         // Purged an hour after expiry.
         let later = l.exp + MAX_LINK_LIFETIME_SECS + 1;
-        store.accept(Pending { user: "carol".into(), launch: l, cwd: "/srv/x".into(), agent: None, session_id: None }, later)
+        store
+            .accept(
+                Pending {
+                    user: "carol".into(),
+                    launch: l,
+                    cwd: "/srv/x".into(),
+                    agent: None,
+                    session_id: None,
+                },
+                later,
+            )
             .unwrap();
     }
 
@@ -577,6 +777,171 @@ pub mod tests {
         let env: HashMap<_, _> = launch_env(&l).into_iter().collect();
         assert_eq!(env["OPSAPI_TASK_NUMBER"], "12");
         assert_eq!(env["OPSAPI_TASK_PROMPT"], "Do it\nwell[31m");
-        assert_eq!(env["OPSAPI_TASK_URL"], "https://ops.example/dashboard/projects/p/tasks/t");
+        assert_eq!(
+            env["OPSAPI_TASK_URL"],
+            "https://ops.example/dashboard/projects/p/tasks/t"
+        );
+    }
+    fn login_claims(now: u64) -> serde_json::Value {
+        let mut c = claims(now, "/srv/x");
+        c["exp"] = json!(now + 120);
+        c["login"] = json!({
+            "email": "Alice@Example.com", "user": "9A8B7C6D-1111-4C4C-9D9D-0123456789AB",
+            "stepup": now - 600
+        });
+        c["report"] = json!({
+            "url": "https://ops.example/api/v2/ai-runner/public/terminal/report",
+            "token": "tok_0123456789abcdefghijklmnopqrstuvwxyz-ABC"
+        });
+        c
+    }
+
+    fn autologin_cfg() -> AutologinConfig {
+        AutologinConfig {
+            enabled: true,
+            max_stepup_age_secs: 43200,
+            users: [("alice@example.com".to_string(), "alice".to_string())].into(),
+        }
+    }
+
+    #[test]
+    fn login_and_report_claims_are_read_and_unknown_claims_ignored() {
+        let now = 1_800_000_000;
+        let mut c = login_claims(now);
+        c["future_claim"] = json!({"anything": [1, 2]});
+        c["login"]["future_field"] = json!(true);
+        let l = verify_ticket(SECRET, &mint(SECRET, c), now).unwrap();
+        let who = l.login.as_ref().unwrap();
+        assert_eq!(who.email, "Alice@Example.com");
+        assert_eq!(who.user, "9a8b7c6d-1111-4c4c-9d9d-0123456789ab");
+        assert_eq!(who.stepup, now - 600);
+        assert_eq!(l.report.as_ref().unwrap().token.len(), 44);
+        // An ordinary link has neither.
+        let plain = verify_ticket(SECRET, &mint(SECRET, claims(now, "/srv/x")), now).unwrap();
+        assert_eq!((plain.login, plain.report), (None, None));
+    }
+
+    #[test]
+    fn bad_login_and_report_claims_are_refused() {
+        let now = 1_800_000_000;
+        for (path, v) in [
+            (["login", "email"], json!("no-at-sign")),
+            (
+                ["login", "email"],
+                json!(format!("{}@example.com", "a".repeat(250))),
+            ),
+            (["login", "email"], json!("a b@example.com")),
+            (["login", "user"], json!("not-a-uuid")),
+            (["login", "user"], json!("6f1c2a9e11114c4c9d9d0123456789ab")),
+            (["login", "stepup"], json!(-1)),
+            (["login", "stepup"], json!("1800000000")),
+            (["report", "url"], json!("http://ops.example/report")),
+            (
+                ["report", "url"],
+                json!(format!("https://ops.example/{}", "x".repeat(500))),
+            ),
+            (["report", "token"], json!("short")),
+            (["report", "token"], json!("x".repeat(129))),
+            (["report", "token"], json!(format!("{}!", "x".repeat(40)))),
+        ] {
+            let mut c = login_claims(now);
+            c[path[0]][path[1]] = v;
+            let r = verify_ticket(SECRET, &mint(SECRET, c), now);
+            assert_eq!(r, Err(LinkError::Invalid), "{path:?}");
+        }
+        let mut c = login_claims(now);
+        c["login"] = json!({"email": "alice@example.com"});
+        assert_eq!(
+            verify_ticket(SECRET, &mint(SECRET, c), now),
+            Err(LinkError::Invalid)
+        );
+        // Local OpsAPI for development.
+        let mut c = login_claims(now);
+        c["report"]["url"] = json!("http://127.0.0.1:4010/report");
+        assert!(verify_ticket(SECRET, &mint(SECRET, c), now).is_ok());
+    }
+
+    #[test]
+    fn autologin_needs_config_mapping_short_link_and_fresh_stepup() {
+        let now = 1_800_000_000;
+        let cfg = autologin_cfg();
+        let check = |c: serde_json::Value, cfg: &AutologinConfig, at: u64| {
+            let l = verify_ticket(SECRET, &mint(SECRET, c), now).unwrap();
+            autologin_user(cfg, &l, at).map(str::to_string)
+        };
+        assert_eq!(
+            check(login_claims(now), &cfg, now),
+            Ok("alice".into()),
+            "email in any case"
+        );
+        let off = AutologinConfig {
+            enabled: false,
+            ..autologin_cfg()
+        };
+        assert_eq!(
+            check(login_claims(now), &off, now),
+            Err(AutologinError::Off)
+        );
+        assert_eq!(
+            check(claims(now, "/srv/x"), &cfg, now),
+            Err(AutologinError::NotAllowed)
+        );
+        let mut c = login_claims(now);
+        c["login"]["email"] = json!("mallory@example.com");
+        assert_eq!(check(c, &cfg, now), Err(AutologinError::NotAllowed));
+        let mut c = login_claims(now);
+        c["exp"] = json!(now + 121);
+        assert_eq!(
+            check(c, &cfg, now),
+            Err(AutologinError::Link(LinkError::Invalid))
+        );
+        let mut c = login_claims(now);
+        c["login"]["stepup"] = json!(now + 1);
+        assert_eq!(
+            check(c, &cfg, now),
+            Err(AutologinError::Link(LinkError::Invalid))
+        );
+        let mut c = login_claims(now);
+        c["login"]["stepup"] = json!(now - 43_201);
+        assert_eq!(check(c, &cfg, now), Err(AutologinError::StepupStale));
+        let strict = AutologinConfig {
+            max_stepup_age_secs: 300,
+            ..autologin_cfg()
+        };
+        assert_eq!(
+            check(login_claims(now), &strict, now),
+            Err(AutologinError::StepupStale)
+        );
+        assert_eq!(AutologinError::StepupStale.code(), "stepup_stale");
+        assert_eq!(AutologinError::Link(LinkError::Expired).code(), "expired");
+    }
+
+    #[test]
+    fn a_link_signs_in_once() {
+        let now = 1_800_000_000;
+        let l = verify_ticket(SECRET, &mint(SECRET, login_claims(now)), now).unwrap();
+        let store = LaunchStore::default();
+        assert!(store.claim_login(&l, now));
+        assert!(!store.claim_login(&l, now + 60));
+        // Remembered until long after the link stopped working.
+        assert!(!store.claim_login(&l, l.exp + MAX_LINK_LIFETIME_SECS - 1));
+    }
+
+    #[test]
+    fn env_carries_the_report_link_when_given() {
+        let now = 1_800_000_000;
+        let l = verify_ticket(SECRET, &mint(SECRET, login_claims(now)), now).unwrap();
+        let env: HashMap<_, _> = launch_env(&l).into_iter().collect();
+        assert_eq!(
+            env["OPSAPI_REPORT_URL"],
+            "https://ops.example/api/v2/ai-runner/public/terminal/report"
+        );
+        assert_eq!(
+            env["OPSAPI_REPORT_TOKEN"],
+            "tok_0123456789abcdefghijklmnopqrstuvwxyz-ABC"
+        );
+        let plain = verify_ticket(SECRET, &mint(SECRET, claims(now, "/srv/x")), now).unwrap();
+        let env: HashMap<_, _> = launch_env(&plain).into_iter().collect();
+        assert!(!env.contains_key("OPSAPI_REPORT_URL") && !env.contains_key("OPSAPI_REPORT_TOKEN"));
     }
 }

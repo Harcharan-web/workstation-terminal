@@ -42,6 +42,40 @@ pub struct OpsapiConfig {
     pub idle_timeout_secs: u64,
     /// Task sessions keep running this long after their browser disconnects.
     pub detach_grace_secs: u64,
+    /// Let OpsAPI sign chosen people in with a launch link (off by default).
+    pub autologin: AutologinConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutologinConfig {
+    pub enabled: bool,
+    /// The OpsAPI step-up (emailed code) may be at most this old.
+    pub max_stepup_age_secs: u64,
+    /// OpsAPI email (any case) -> terminal user. The user signs in through their authorized key
+    /// that allows `local`; nobody else can be signed in by a link.
+    pub users: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for AutologinConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_stepup_age_secs: 12 * 3600,
+            users: Default::default(),
+        }
+    }
+}
+
+impl AutologinConfig {
+    /// The terminal user mapped to an OpsAPI email, compared case-insensitively.
+    pub fn user_for(&self, email: &str) -> Option<&str> {
+        let email = email.to_lowercase();
+        self.users
+            .iter()
+            .find(|(e, _)| e.to_lowercase() == email)
+            .map(|(_, u)| u.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +279,7 @@ impl Default for OpsapiConfig {
             agents: Vec::new(),
             idle_timeout_secs: 4 * 3600,
             detach_grace_secs: 4 * 3600,
+            autologin: AutologinConfig::default(),
         }
     }
 }
@@ -657,7 +692,9 @@ impl Config {
             if !agent_ids.insert(a.id.clone()) {
                 errs.push(format!("duplicate opsapi agent id {:?}", a.id));
             }
-            if a.run.trim().is_empty() || a.run.len() > 1024 || a.run.chars().any(|c| c.is_control())
+            if a.run.trim().is_empty()
+                || a.run.len() > 1024
+                || a.run.chars().any(|c| c.is_control())
             {
                 errs.push(format!(
                     "opsapi agent {:?}: run must be one line of at most 1024 characters",
@@ -665,14 +702,47 @@ impl Config {
                 ));
             }
         }
+        let al = &o.autologin;
+        if al.enabled && o.webhook_secret.as_deref().unwrap_or("").is_empty() {
+            errs.push("opsapi.autologin needs opsapi.webhook_secret".into());
+        }
+        if al.max_stepup_age_secs == 0 {
+            errs.push("opsapi.autologin.max_stepup_age_secs must be positive".into());
+        }
+        let mut emails = std::collections::HashSet::new();
+        for (email, user) in &al.users {
+            let at = email.split_once('@');
+            if email.len() > 254
+                || email.chars().any(|c| c.is_whitespace() || c.is_control())
+                || !matches!(at, Some((l, d)) if !l.is_empty() && !d.is_empty())
+            {
+                errs.push(format!(
+                    "opsapi.autologin.users: {email:?} isn't an email address"
+                ));
+            }
+            if !emails.insert(email.to_lowercase()) {
+                errs.push(format!("opsapi.autologin.users: {email:?} is listed twice"));
+            }
+            if !crate::auth::keys::valid_user(user) {
+                errs.push(format!(
+                    "opsapi.autologin.users: {user:?} (for {email:?}) isn't a valid user name"
+                ));
+            }
+        }
         for r in &self.local.allowed_roots {
             if !r.is_absolute() {
-                errs.push(format!("local.allowed_roots entry {} must be absolute", r.display()));
+                errs.push(format!(
+                    "local.allowed_roots entry {} must be absolute",
+                    r.display()
+                ));
             }
         }
         for sh in &self.local.allowed_shells {
             if sh.to_string_lossy().contains(['\'', '"', '\\']) {
-                errs.push(format!("local.allowed_shells: {} must not contain quotes", sh.display()));
+                errs.push(format!(
+                    "local.allowed_shells: {} must not contain quotes",
+                    sh.display()
+                ));
             }
         }
         let ss = &self.sessions;
@@ -749,7 +819,10 @@ impl Config {
         }
         for r in &self.local.allowed_roots {
             if !r.is_dir() {
-                errs.push(format!("local.allowed_roots: {} is not a folder", r.display()));
+                errs.push(format!(
+                    "local.allowed_roots: {} is not a folder",
+                    r.display()
+                ));
             }
         }
         if self.remote.enabled {
@@ -840,6 +913,40 @@ mod tests {
         let c = Config::from_yaml(SAMPLE_CONFIG).unwrap();
         assert!(c.validate_static().is_empty(), "{:?}", c.validate_static());
         assert_eq!(c.server.port, DEFAULT_PORT);
+    }
+
+    #[test]
+    fn autologin_is_off_by_default_and_validated() {
+        let c = Config::default();
+        assert!(!c.opsapi.autologin.enabled);
+        assert_eq!(c.opsapi.autologin.max_stepup_age_secs, 43200);
+        let c = Config::from_yaml(
+            "opsapi:\n  webhook_secret: \"0123456789abcdef0123456789abcdef\"\n  autologin:\n    \
+             enabled: true\n    users:\n      \"Alice@Example.com\": alice\n",
+        )
+        .unwrap();
+        assert!(c.validate_static().is_empty(), "{:?}", c.validate_static());
+        assert_eq!(
+            c.opsapi.autologin.user_for("alice@EXAMPLE.com"),
+            Some("alice")
+        );
+        assert_eq!(c.opsapi.autologin.user_for("bob@example.com"), None);
+        let bad = Config::from_yaml(
+            "opsapi:\n  autologin:\n    enabled: true\n    max_stepup_age_secs: 0\n    users:\n      \
+             \"a@x.io\": Root\n      \"A@X.io\": bob\n      \"nobody\": carol\n",
+        )
+        .unwrap();
+        let errs = bad.validate_static().join("\n");
+        for want in [
+            "needs opsapi.webhook_secret",
+            "max_stepup_age_secs",
+            "\"Root\"",
+            "listed twice",
+            "\"nobody\"",
+        ] {
+            assert!(errs.contains(want), "{want}: {errs}");
+        }
+        assert!(Config::from_yaml("opsapi:\n  autologin:\n    enable: true\n").is_err());
     }
 
     #[test]

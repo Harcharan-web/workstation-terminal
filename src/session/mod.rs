@@ -374,12 +374,22 @@ impl SessionManager {
                 .field("profile", t.profile.as_deref().unwrap_or("adhoc"));
         }
         if let Some(t) = &sess.launch {
-            ev = ev.field("opsapi_launch", &t.id).field("opsapi_task", &t.task);
+            ev = ev
+                .field("opsapi_launch", &t.id)
+                .field("opsapi_task", &t.task);
         }
         self.audit.log(ev);
 
         if let Some(t) = &sess.launch {
-            crate::opsapi::notify(&self.cfg, "session_start", t, &sess.id, &sess.user, None, None);
+            crate::opsapi::notify(
+                &self.cfg,
+                "session_start",
+                t,
+                &sess.id,
+                &sess.user,
+                None,
+                None,
+            );
         }
 
         let mgr = self.clone();
@@ -563,9 +573,15 @@ impl SessionManager {
                 continue;
             }
             let (grace, idle) = if s.launch.is_some() {
-                (self.cfg.opsapi.detach_grace_secs, self.cfg.opsapi.idle_timeout_secs)
+                (
+                    self.cfg.opsapi.detach_grace_secs,
+                    self.cfg.opsapi.idle_timeout_secs,
+                )
             } else {
-                (self.cfg.sessions.detach_grace_secs, self.cfg.sessions.idle_timeout_secs)
+                (
+                    self.cfg.sessions.detach_grace_secs,
+                    self.cfg.sessions.idle_timeout_secs,
+                )
             };
             if let Some(t) = *s.detached_since.lock().unwrap()
                 && t.elapsed() >= Duration::from_secs(grace)
@@ -742,7 +758,8 @@ mod tests {
             .open(&login("b"), local(), spec("sleep 30"), None, None)
             .unwrap();
         assert_eq!(
-            m.open(&login("c"), local(), spec("sleep 30"), None, None).err(),
+            m.open(&login("c"), local(), spec("sleep 30"), None, None)
+                .err(),
             Some(OpenError::TotalLimit(2))
         );
         m.shutdown().await;
@@ -757,7 +774,13 @@ mod tests {
     async fn reattach_replays_output_and_detaches_old() {
         let m = mgr(Config::default());
         let s = m
-            .open(&login("a"), local(), spec("echo MARKER; sleep 30"), None, None)
+            .open(
+                &login("a"),
+                local(),
+                spec("echo MARKER; sleep 30"),
+                None,
+                None,
+            )
             .unwrap();
         let (mut rx1, _) = m.attach(&s, 1);
         // Wait for output on the first connection.
@@ -823,13 +846,25 @@ mod tests {
         let a = login("a");
         // An agent printing on its own, with nobody typing and no browser attached.
         let busy = m
-            .open(&a, local(), spec("while true; do echo working; sleep 0.2; done"), None, tag())
+            .open(
+                &a,
+                local(),
+                spec("while true; do echo working; sleep 0.2; done"),
+                None,
+                tag(),
+            )
             .unwrap();
         let quiet = m.open(&a, local(), spec("sleep 30"), None, tag()).unwrap();
         let plain = m.open(&a, local(), spec("sleep 30"), None, None).unwrap();
         m.reap();
-        assert!(plain.is_closed(), "ordinary sessions keep the normal detach limit");
-        assert!(!busy.is_closed() && !quiet.is_closed(), "task sessions survive a closed browser");
+        assert!(
+            plain.is_closed(),
+            "ordinary sessions keep the normal detach limit"
+        );
+        assert!(
+            !busy.is_closed() && !quiet.is_closed(),
+            "task sessions survive a closed browser"
+        );
         tokio::time::sleep(Duration::from_millis(1300)).await;
         m.reap();
         assert!(!busy.is_closed(), "output counts as activity");
@@ -842,7 +877,13 @@ mod tests {
         let m = mgr(Config::default());
         let first = login("a");
         let s = m
-            .open(&first, local(), spec("sleep 30"), Some("build".into()), None)
+            .open(
+                &first,
+                local(),
+                spec("sleep 30"),
+                Some("build".into()),
+                None,
+            )
             .unwrap();
         assert_eq!(s.info().name.as_deref(), Some("build"));
         assert_eq!(s.login_id(), first.id);

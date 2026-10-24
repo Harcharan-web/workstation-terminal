@@ -107,5 +107,13 @@ logging:
 #     - { id: claude, name: Claude Code, run: 'claude "$OPSAPI_TASK_PROMPT"' }
 #     - { id: codex,  name: Codex,       run: 'codex "$OPSAPI_TASK_PROMPT"' }
 #     - { id: cursor, name: Cursor,      run: 'cursor-agent "$OPSAPI_TASK_PROMPT"' }
+#     # Never stops to ask before running commands or editing files. Only acceptable because this
+#     # terminal runs under its own macOS account (docs/OPSAPI.md); leave it out to forbid it.
+#     - { id: claude_auto, name: "Claude Code (unattended)", run: 'claude --dangerously-skip-permissions "$OPSAPI_TASK_PROMPT"' }
 #   idle_timeout_secs: 14400   # task tabs: closed after this long with neither input nor output
 #   detach_grace_secs: 14400   # task tabs: kept running this long after the browser closes
+#   autologin:                 # let OpsAPI sign chosen people in with a task link (off by default)
+#     enabled: false
+#     max_stepup_age_secs: 43200   # their emailed OpsAPI code must be at most this old
+#     users:                       # OpsAPI email (any case) -> terminal user with a `local` key
+#       "alice@example.com": alice

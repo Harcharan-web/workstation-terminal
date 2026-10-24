@@ -199,7 +199,9 @@ fn validate(m: &ClientMsg) -> Result<(), DecodeError> {
                 return Err(DecodeError::Invalid("name"));
             }
             if launch.as_deref().is_some_and(|t| {
-                t.is_empty() || t.len() > 64 || !t.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+                t.is_empty()
+                    || t.len() > 64
+                    || !t.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
             }) {
                 return Err(DecodeError::Invalid("launch"));
             }
@@ -285,7 +287,10 @@ mod tests {
             )
             .unwrap(),
             ClientMsg::Open {
-                target: OpenTarget::Local { shell: None, cwd: None },
+                target: OpenTarget::Local {
+                    shell: None,
+                    cwd: None
+                },
                 ..
             }
         ));

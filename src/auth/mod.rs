@@ -74,7 +74,7 @@ impl AuthService {
         }
     }
 
-    fn check_lockout(&self, ip: &str, user: Option<&str>) -> Result<(), AuthError> {
+    pub fn check_lockout(&self, ip: &str, user: Option<&str>) -> Result<(), AuthError> {
         let mut keys = vec![format!("ip:{ip}")];
         if let Some(u) = user {
             keys.push(format!("user:{u}"));
@@ -133,45 +133,91 @@ impl AuthService {
         self.check_lockout(ip, None)?;
         let result = self.verify_inner(challenge_id, signature, binding, ip, via);
         match &result {
-            Ok((_, login)) => {
-                self.failures.record_success(&format!("ip:{ip}"));
-                self.failures
-                    .record_success(&format!("user:{}", login.user));
-                self.metrics.inc(&self.metrics.auth_success);
-                self.audit.log(
-                    AuditEvent::new("auth_success")
-                        .ip(ip)
-                        .user(&login.user)
-                        .field("key", &login.key_fingerprint)
-                        .field("login_id", &login.id)
-                        .field("via", via),
-                );
-            }
+            Ok((_, login)) => self.record_sign_in(login, ip, via, &[]),
             Err((user, e)) => {
-                self.metrics.inc(&self.metrics.auth_failure);
-                let mut ev = AuditEvent::new("auth_failure")
-                    .ip(ip)
-                    .field("reason", &format!("{:?}", e))
-                    .field("via", via);
-                if let Some(u) = user {
-                    ev = ev.user(u);
-                }
-                self.audit.log(ev);
-                let mut locked = self.failures.record_failure(&format!("ip:{ip}"));
-                if let Some(u) = user {
-                    locked |= self.failures.record_failure(&format!("user:{u}"));
-                }
-                if locked {
-                    self.metrics.inc(&self.metrics.auth_lockouts);
-                    let mut ev = AuditEvent::new("auth_lockout").ip(ip);
-                    if let Some(u) = user {
-                        ev = ev.user(u);
-                    }
-                    self.audit.log(ev);
-                }
+                self.record_failed_sign_in(ip, user.as_deref(), &format!("{:?}", e), via, &[])
             }
         }
         result.map_err(|(_, e)| e)
+    }
+
+    /// Admit a sign-in attempt that doesn't start with a challenge (an OpsAPI link): the same
+    /// per-IP rate limit as challenges, and the IP must not be locked out.
+    pub fn admit(&self, ip: &str) -> Result<(), AuthError> {
+        if !self.challenge_rl.check(&format!("ip:{ip}")) {
+            self.audit.log(AuditEvent::new("auth_rate_limited").ip(ip));
+            return Err(AuthError::RateLimited);
+        }
+        self.check_lockout(ip, None)
+    }
+
+    /// Sign `key`'s user in without a challenge (the caller has proved who they are another
+    /// way), recorded exactly like a key sign-in. Revoking the key ends the login.
+    pub fn sign_in_with_key(
+        &self,
+        key: &keys::AuthorizedKey,
+        ip: &str,
+        via: &'static str,
+        extra: &[(&str, &str)],
+    ) -> Result<(String, Login), AuthError> {
+        self.check_lockout(ip, Some(&key.user))?;
+        let (token, login) =
+            self.logins
+                .create(&key.user, &key.fingerprint, key.access.clone(), ip, via);
+        self.record_sign_in(&login, ip, via, extra);
+        Ok((token, login))
+    }
+
+    fn record_sign_in(&self, login: &Login, ip: &str, via: &str, extra: &[(&str, &str)]) {
+        self.failures.record_success(&format!("ip:{ip}"));
+        self.failures
+            .record_success(&format!("user:{}", login.user));
+        self.metrics.inc(&self.metrics.auth_success);
+        let mut ev = AuditEvent::new("auth_success")
+            .ip(ip)
+            .user(&login.user)
+            .field("key", &login.key_fingerprint)
+            .field("login_id", &login.id)
+            .field("via", via);
+        for (k, v) in extra {
+            ev = ev.field(k, v);
+        }
+        self.audit.log(ev);
+    }
+
+    /// Audit a failed sign-in and count it towards the IP's (and user's) lock-out.
+    pub fn record_failed_sign_in(
+        &self,
+        ip: &str,
+        user: Option<&str>,
+        reason: &str,
+        via: &str,
+        extra: &[(&str, &str)],
+    ) {
+        self.metrics.inc(&self.metrics.auth_failure);
+        let mut ev = AuditEvent::new("auth_failure")
+            .ip(ip)
+            .field("reason", reason)
+            .field("via", via);
+        if let Some(u) = user {
+            ev = ev.user(u);
+        }
+        for (k, v) in extra {
+            ev = ev.field(k, v);
+        }
+        self.audit.log(ev);
+        let mut locked = self.failures.record_failure(&format!("ip:{ip}"));
+        if let Some(u) = user {
+            locked |= self.failures.record_failure(&format!("user:{u}"));
+        }
+        if locked {
+            self.metrics.inc(&self.metrics.auth_lockouts);
+            let mut ev = AuditEvent::new("auth_lockout").ip(ip);
+            if let Some(u) = user {
+                ev = ev.user(u);
+            }
+            self.audit.log(ev);
+        }
     }
 
     fn verify_inner(

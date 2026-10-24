@@ -42,10 +42,12 @@
 | T19 | **Orphaned processes** | Each session's child is a session leader. On close the whole process group gets SIGHUP, then SIGKILL after a grace period. Graceful shutdown closes every session. | `terminate_kills_process_group`, `graceful_shutdown_closes_sessions_and_sockets` |
 | T20 | **Accidental exposure** | A non-loopback bind needs `allow_remote_access: true` **and** TLS. A wildcard bind needs explicit `allowed_origins`. Metrics are off on the HTTP port by default and loopback-only when enabled. Admin functions exist only on the private Unix socket. | `remote_exposure_requires_opt_in_tls_and_origins`, `serve_refuses_unsafe_remote_exposure` |
 
-| T21 | **Forged or replayed task links** (OpsAPI) | Links are HMAC-SHA256 signed with a secret shared only with OpsAPI (constant-time check), expire (≤ 1 h), and open once; a link accepted by one user can't be claimed or opened by another. A link never signs anyone in: the person still proves their SSH key. | `tampered_wrong_key_expired_and_long_lived_links_are_refused`, `bad_links_are_refused`, `launches_are_single_use_per_user` |
+| T21 | **Forged or replayed task links** (OpsAPI) | Links are HMAC-SHA256 signed with a secret shared only with OpsAPI (constant-time check), expire (≤ 1 h), and open once; a link accepted by one user can't be claimed or opened by another. Unless auto sign-in (T25) is on for that person, a link never signs anyone in: they still prove their SSH key. | `tampered_wrong_key_expired_and_long_lived_links_are_refused`, `bad_links_are_refused`, `launches_are_single_use_per_user` |
 | T22 | **Folder escape** via a link or a saved tab | The folder is resolved with `realpath` (symlinks followed) and must be an existing directory inside `local.allowed_roots`; without roots, folders and links are refused. Roots choose where a tab starts; they are not a sandbox: the shell can go anywhere the account can (see "A separate macOS account" in OPSAPI.md). | `folders_must_be_real_directories_inside_a_root`, `tabs_may_reopen_in_an_allowed_folder_only` |
 | T23 | **Command injection** through task text | A link carries an agent **id**; command lines come only from `opsapi.agents` in the config. Task text (prompt, title) reaches the shell only as environment variables, never as shell syntax; control characters are stripped. The banner is built with `textContent`. | `task_link_opens_the_folder_starts_the_agent_and_reports_to_opsapi`, `bad_fields_are_refused` |
 | T24 | **Webhook spoofing** towards OpsAPI | Webhooks are HMAC-signed and carry only the launch id (OpsAPI looks the task up from its own record, never from the webhook) and a timestamp OpsAPI checks. | `task_link_opens_the_folder_starts_the_agent_and_reports_to_opsapi` |
+| T25 | **Sign-in through OpsAPI** (auto sign-in, `POST /api/launch/login`) | Off by default. Needs a signed link carrying `login`, living ≤ 120 s, whose OpsAPI step-up (emailed code) is no later than the link and no older than `opsapi.autologin.max_stepup_age_secs` (12 h); the email must be listed in this gateway's own config, and only maps to the terminal user listed there. The login is made through that user's key with `local` access (revoking the key ends it). Each link signs in once. Origin-checked, rate-limited per IP and counted towards the SSH sign-in lock-out; audited as `auth_success`/`auth_failure` with `via=opsapi_launch` and the OpsAPI email and user. | `a_link_with_login_signs_in_once_and_then_opens_the_task`, `links_that_may_not_sign_in_are_refused`, `auto_sign_in_is_off_by_default_and_failures_lock_out`, `autologin_needs_config_mapping_short_link_and_fresh_stepup` |
+| T26 | **Report token leakage** | The per-launch token reaches only the task shell's environment (`OPSAPI_REPORT_TOKEN`), is never logged, and on the OpsAPI side can only attach pull requests and notes to its own task. | `a_link_with_login_signs_in_once_and_then_opens_the_task`, `env_carries_the_report_link_when_given` |
 
 ## Residual risks and limitations
 
@@ -75,6 +77,13 @@
 - **Task text is untrusted input to agents.** Anyone who can edit a task in OpsAPI can steer the agent
   it starts (prompt injection). Run task terminals under an account with no access to anything the work
   doesn't need (docs/OPSAPI.md, "A separate macOS account").
+- **Auto sign-in moves trust to OpsAPI.** For the people listed under `opsapi.autologin.users`, an
+  OpsAPI account plus access to its mailbox (for the step-up code) is as good as their SSH key, and
+  whoever holds the shared secret can mint such links. List only people you'd give a shell on this
+  account, and rotate the secret if OpsAPI may be compromised.
+- **Unattended agents.** An agent configured like `claude_auto` (`--dangerously-skip-permissions`) acts
+  on task text without asking. That is only acceptable because task terminals run under their own macOS
+  account; leave it out of `opsapi.agents` to forbid it.
 - **No external audit yet.**
 
 ## Operational guidance

@@ -12,7 +12,8 @@ After the person signs in **with their SSH key as usual**, the gateway opens a t
 in that folder and starts the agent with the task as its first message. When the agent exits they are
 left in an ordinary shell in the same folder. OpsAPI shows the session on the task until it ends.
 
-A launch link never signs anyone in, never carries a command, and works once.
+A launch link never carries a command and works once. It signs nobody in, unless this gateway has
+turned on [auto sign-in](#auto-sign-in-for-power-users) for that person.
 
 ## Setting it up
 
@@ -31,6 +32,9 @@ A launch link never signs anyone in, never carries a command, and works once.
        - { id: claude, name: Claude Code, run: 'claude "$OPSAPI_TASK_PROMPT"' }
        - { id: codex,  name: Codex,       run: 'codex "$OPSAPI_TASK_PROMPT"' }
        - { id: cursor, name: Cursor,      run: 'cursor-agent "$OPSAPI_TASK_PROMPT"' }
+       # Never stops to ask. Only acceptable because this gateway runs under its own macOS
+       # account (below); leave it out to forbid unattended agents.
+       - { id: claude_auto, name: "Claude Code (unattended)", run: 'claude --dangerously-skip-permissions "$OPSAPI_TASK_PROMPT"' }
      idle_timeout_secs: 14400             # task tabs: 4 h with neither input nor output
      detach_grace_secs: 14400             # task tabs keep running 4 h after the browser closes
    ```
@@ -47,6 +51,7 @@ environment variables, so its text is never parsed as shell syntax:
 | `OPSAPI_TASK_TITLE`, `OPSAPI_TASK_NUMBER` | Task title and number |
 | `OPSAPI_TASK_URL` | Link back to the task |
 | `OPSAPI_TASK`, `OPSAPI_LAUNCH` | Task id and launch id |
+| `OPSAPI_REPORT_URL`, `OPSAPI_REPORT_TOKEN` | Where and how the agent tells OpsAPI about its pull request (only when the link has `report`) |
 
 Always quote it (`"$OPSAPI_TASK_PROMPT"`).
 
@@ -78,8 +83,90 @@ Always quote it (`"$OPSAPI_TASK_PROMPT"`).
    Header `X-Opsapi-Signature: sha256=<hex of HMAC-SHA256(secret, body)>`. Up to three tries.
 
 Ticket format (made by OpsAPI): `base64url(json).hex(hmac_sha256(secret, base64url(json)))`, claims
-`v` (1), `id`, `iat`, `exp`, `task`, `num`, `title`, `path`, `agent`, `prompt`, `by`, `return`, `ws`.
+`v` (1), `id`, `iat`, `exp`, `task`, `num`, `title`, `path`, `agent`, `prompt`, `by`, `return`, `ws`,
+and optionally `login` `{email (≤ 254), user (UUID), stepup (unix seconds)}` and `report`
+`{url (https, ≤ 512), token ([A-Za-z0-9_-]{32,128})}`. A malformed `login` or `report` makes the whole
+link invalid. Claims the gateway doesn't know are ignored, so a newer OpsAPI works with an older gateway.
 The OpsAPI side is documented in `docs/AI_RUNNER_WEB_TERMINAL.md` in the OpsAPI repository.
+
+## Reporting the pull request
+
+When the link has `report`, the shell gets `OPSAPI_REPORT_URL` and `OPSAPI_REPORT_TOKEN`. The prompt
+OpsAPI writes asks the agent to call it once its pull request is open:
+
+```sh
+curl -fsS -X POST "$OPSAPI_REPORT_URL" -H "Authorization: Bearer $OPSAPI_REPORT_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"pr_url":"https://github.com/o/r/pull/12"}'
+```
+
+The token can only attach pull requests and notes to its own task. The gateway never logs it.
+
+## Auto sign-in for power users
+
+Off by default. When it is on, OpsAPI may sign chosen people in with the task link itself, so a task
+opens with one click. All of these must hold:
+
+- OpsAPI: the terminal has auto sign-in turned on there, the person holds `ai_terminal_autologin`, and
+  they confirmed an emailed code (a *step-up*) in the last 12 hours. Only then does OpsAPI add the
+  `login` claim, and such a link lives 120 seconds.
+- This gateway: `opsapi.autologin.enabled`, and the person's OpsAPI email is listed under `users`,
+  mapped to a terminal user who has an authorized key allowing `local`:
+
+  ```yaml
+  opsapi:
+    autologin:
+      enabled: true
+      max_stepup_age_secs: 43200      # the step-up may be at most this old
+      users:                          # OpsAPI email (any case) -> terminal user
+        "alice@example.com": alice
+  ```
+
+The page sees a waiting link with `login` and, if nobody is signed in, calls
+
+```
+POST /api/launch/login
+{"ticket": "<the #launch= ticket>"}
+```
+
+No login cookie is needed; the Origin is checked like every state-changing call, and the call is
+rate-limited per IP and counted towards the same lock-out as SSH sign-in. The gateway verifies the
+ticket exactly like `/api/launch`, then requires: `login` present; `exp - iat ≤ 120`; auto sign-in on;
+the email mapped; the mapped user has a key allowing `local`; `stepup ≤ iat` and
+`now - stepup ≤ max_stepup_age_secs`. Each launch id signs someone in **once**.
+
+On success the answer is the same as an SSH sign-in, with the same session cookie:
+
+```json
+{"user": "alice", "access": "local", "expires_unix": 1792643200}
+```
+
+The login is made **through that user's key** (its fingerprint and access), so revoking or narrowing the
+key ends it like any other. The audit log gets `auth_success` with `via=opsapi_launch`, `opsapi_email`,
+`opsapi_user` and `opsapi_launch`; refusals are `auth_failure` with the reason. Then the page posts the
+same ticket to `/api/launch` as usual.
+
+Errors (`{"error": "<code>", "message": "…"}`):
+
+| Status | `error` | When |
+|---|---|---|
+| 400 | `invalid_link` | bad signature or fields, lifetime over 120 s, or `stepup` later than `iat` |
+| 400 | `expired`, `not_configured` | as for `/api/launch` |
+| 403 | `autologin_off` | `opsapi.autologin.enabled` is false (or local terminals are off); not counted towards lock-out |
+| 403 | `autologin_not_allowed` | the link has no `login`, the email isn't mapped, or the mapped user has no key allowing `local` |
+| 403 | `stepup_stale` | the step-up is older than `max_stepup_age_secs` |
+| 409 | `already_used` | this link already signed someone in |
+| 429 | `rate_limited`, `locked_out` | as for SSH sign-in |
+| 503 | `auth_unavailable` | the authorized keys file is missing or invalid |
+| 403 | `bad_origin` | the request came from another site |
+
+On any error the page shows the normal SSH sign-in screen with the task still waiting and a one-line
+reason.
+
+What this still protects: a stolen OpsAPI password alone isn't a shell (it also needs the emailed code
+within 12 hours and an email this gateway lists); a captured link is useless after 120 seconds or once
+used; only people the gateway's owner listed can be signed in, and only as the terminal user they were
+mapped to. What it gives up: for those people, OpsAPI (and their mailbox) now stands in for their SSH
+key. List only people you'd hand a shell on this account to.
 
 ## A separate macOS account for task terminals
 
