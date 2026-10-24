@@ -556,14 +556,15 @@ struct LaunchReq {
 }
 
 /// Accept an OpsAPI task link for the signed-in user (see `crate::opsapi`). The browser then
-/// opens a tab with `{"type":"open", "launch": <id>}`. A link never signs anyone in.
+/// opens a tab with `{"type":"open", "launch": <id>}`. Signing in is separate (see
+/// [`launch_login`]).
 async fn accept_launch(
     State(app): State<App>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Result<Json<LaunchReq>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    use crate::opsapi::{FolderError, LinkError};
+    use crate::opsapi::FolderError;
     let (_, login) = require_login(&app, &headers)?;
     let Json(req) = body?;
     let ip = client_ip(&app.cfg, peer, &headers).to_string();
@@ -585,15 +586,8 @@ async fn accept_launch(
     }
     let cfg = &app.cfg;
     let now = crate::opsapi::unix_now();
-    let secret = cfg.opsapi.webhook_secret.as_deref().unwrap_or("");
-    let launch = crate::opsapi::verify_ticket(secret, &req.ticket, now).map_err(|e| {
-        let code = match e {
-            LinkError::Expired => "expired",
-            LinkError::NotConfigured => "not_configured",
-            LinkError::Invalid => "invalid_link",
-        };
-        deny(StatusCode::BAD_REQUEST, code, e.to_string())
-    })?;
+    let launch = verify_launch_ticket(cfg, &req.ticket, now)
+        .map_err(|e| deny(StatusCode::BAD_REQUEST, e.code(), e.to_string()))?;
     let cwd =
         crate::opsapi::resolve_folder(&cfg.local.allowed_roots, &launch.path).map_err(|e| {
             let code = match e {
@@ -654,6 +648,165 @@ async fn accept_launch(
     .into_response())
 }
 
+/// Verify a launch ticket against this terminal's shared secret (`/api/launch` and
+/// `/api/launch/login` alike).
+fn verify_launch_ticket(
+    cfg: &Config,
+    ticket: &str,
+    now: u64,
+) -> Result<crate::opsapi::Launch, crate::opsapi::LinkError> {
+    let secret = cfg.opsapi.webhook_secret.as_deref().unwrap_or("");
+    crate::opsapi::verify_ticket(secret, ticket, now)
+}
+
+const AUTOLOGIN_VIA: &str = "opsapi_launch";
+
+/// Sign someone in with an OpsAPI link that carries `login` (see `crate::opsapi`): only when
+/// `opsapi.autologin` is on and maps their OpsAPI email to a terminal user, through that user's
+/// key with `local` access, and once per link. Rate-limited and lock-out tracked like a key
+/// sign-in. The page then posts the same ticket to `/api/launch` as usual.
+async fn launch_login(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<LaunchReq>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(req) = body?;
+    let cfg = &app.cfg;
+    let ip = client_ip(cfg, peer, &headers).to_string();
+    if !(cfg.opsapi.autologin.enabled && cfg.local.enabled) {
+        // Nothing was tried, so this doesn't count towards a lock-out.
+        app.audit.log(
+            AuditEvent::new("auth_failure")
+                .ip(&ip)
+                .field("reason", "autologin_off")
+                .field("via", AUTOLOGIN_VIA),
+        );
+        let e = crate::opsapi::AutologinError::Off;
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            e.code(),
+            e.to_string(),
+        ));
+    }
+    app.auth.admit(&ip)?;
+    let now = crate::opsapi::unix_now();
+    let (launch, key) = match autologin_key(&app, &req.ticket, &ip, now) {
+        Ok(v) => v,
+        Err(f) => {
+            let AutologinFailure {
+                who,
+                user,
+                error: e,
+            } = *f;
+            let extra: Vec<(&str, &str)> = who
+                .as_ref()
+                .map(|w| {
+                    vec![
+                        ("opsapi_email", w.email.as_str()),
+                        ("opsapi_user", w.user.as_str()),
+                    ]
+                })
+                .unwrap_or_default();
+            app.auth
+                .record_failed_sign_in(&ip, user.as_deref(), e.code, AUTOLOGIN_VIA, &extra);
+            return Err(e);
+        }
+    };
+    let who = launch.login.as_ref().expect("checked by autologin_user");
+    let (token, login) = app.auth.sign_in_with_key(
+        &key,
+        &ip,
+        AUTOLOGIN_VIA,
+        &[
+            ("opsapi_email", &who.email),
+            ("opsapi_user", &who.user),
+            ("opsapi_launch", &launch.id),
+        ],
+    )?;
+    let mut resp = Json(json!({
+        "user": login.user,
+        "access": login.access.to_string(),
+        "expires_unix": login.expires_unix,
+    }))
+    .into_response();
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        app.cookie(app.session_cookie(), &token, app.cfg.auth.session_ttl_secs),
+    );
+    Ok(resp)
+}
+
+/// Why `/api/launch/login` refused, with the OpsAPI user from the link and the mapped terminal
+/// user when known (for the audit log and lock-out).
+struct AutologinFailure {
+    who: Option<crate::opsapi::LoginClaim>,
+    user: Option<String>,
+    error: ApiError,
+}
+
+/// The checks behind `/api/launch/login`. On success the link is used up for signing in.
+fn autologin_key(
+    app: &AppState,
+    ticket: &str,
+    ip: &str,
+    now: u64,
+) -> Result<(crate::opsapi::Launch, crate::auth::keys::AuthorizedKey), Box<AutologinFailure>> {
+    use crate::opsapi::AutologinError;
+    let cfg = &app.cfg;
+    let launch = verify_launch_ticket(cfg, ticket, now).map_err(|e| {
+        Box::new(AutologinFailure {
+            who: None,
+            user: None,
+            error: ApiError::new(StatusCode::BAD_REQUEST, e.code(), e.to_string()),
+        })
+    })?;
+    let fail = |user: Option<&str>, error: ApiError| {
+        Box::new(AutologinFailure {
+            who: launch.login.clone(),
+            user: user.map(str::to_string),
+            error,
+        })
+    };
+    let user = crate::opsapi::autologin_user(&cfg.opsapi.autologin, &launch, now).map_err(|e| {
+        let status = match e {
+            AutologinError::Link(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::FORBIDDEN,
+        };
+        fail(None, ApiError::new(status, e.code(), e.to_string()))
+    })?;
+    app.auth
+        .check_lockout(ip, Some(user))
+        .map_err(|e| fail(Some(user), e.into()))?;
+    let keys = app
+        .auth
+        .keys
+        .current()
+        .map_err(|_| fail(Some(user), AuthError::KeysUnavailable.into()))?;
+    let key = keys
+        .for_user(user)
+        .find(|k| k.access.local)
+        .cloned()
+        .ok_or_else(|| {
+            let e = AutologinError::NotAllowed;
+            fail(
+                Some(user),
+                ApiError::new(StatusCode::FORBIDDEN, e.code(), e.to_string()),
+            )
+        })?;
+    if !app.launches.claim_login(&launch, now) {
+        return Err(fail(
+            Some(user),
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "already_used",
+                "this link has already signed someone in; sign in with your SSH key",
+            ),
+        ));
+    }
+    Ok((launch, key))
+}
+
 async fn get_workspace(State(app): State<App>, headers: HeaderMap) -> Result<Response, ApiError> {
     let (_, login) = require_login(&app, &headers)?;
     Ok(Json(app.workspaces.load(&login.user)).into_response())
@@ -701,6 +854,7 @@ pub fn router(app: App) -> Router {
         .route("/api/sessions", get(list_sessions))
         .route("/api/workspace", get(get_workspace).put(put_workspace))
         .route("/api/launch", post(accept_launch))
+        .route("/api/launch/login", post(launch_login))
         .route(
             "/api/sessions/{id}",
             delete(close_session).patch(rename_session),

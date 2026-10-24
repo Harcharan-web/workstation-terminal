@@ -12,21 +12,26 @@
   const $ = (id) => document.getElementById(id);
   const prefs = loadPrefs();
   // OpsAPI task link: https://<this gateway>/#launch=<ticket>. The fragment never reaches
-  // proxies or logs. The server verifies the ticket after the user signs in with their key;
-  // until then it is only used to say which task is waiting (display only, as text).
+  // proxies or logs. The server verifies the ticket after the user signs in with their key, or
+  // signs them in with it when the link carries `login` and the terminal allows it. The page
+  // reads the payload only to say which task is waiting and whether to try that (unverified).
   const launchTicket = (function () {
     const m = /(?:^#|&)launch=([^&]+)/.exec(location.hash || "");
     if (!m) return null;
     try { return decodeURIComponent(m[1]); } catch (_) { return null; }
   })();
   let launchHandled = false;
-  function launchPreview() {
+  let autoLoginTried = false;
+  function launchClaims() {
     try {
       const b64 = launchTicket.split(".")[0].replace(/-/g, "+").replace(/_/g, "/");
       const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-      const c = JSON.parse(new TextDecoder().decode(bytes));
-      return { number: c.num, title: String(c.title || "") };
+      return JSON.parse(new TextDecoder().decode(bytes));
     } catch (_) { return null; }
+  }
+  function launchPreview() {
+    const c = launchClaims();
+    return c ? { number: c.num, title: String(c.title || "") } : null;
   }
 
   // ---------- small utilities ----------
@@ -764,7 +769,10 @@
       me = await api("GET", "/api/me");
     } catch (e) {
       me = null;
-      toLogin(e.status === 401 ? "" : e.message);
+      if (e.status !== 401) { toLogin(e.message); return; }
+      const auto = await autoLogin();
+      if (auto === true) { await enter(); return; }
+      toLogin(auto || "");
       return;
     }
     $("who").textContent = me.user;
@@ -774,6 +782,22 @@
     await restoreWorkspace();
     if (launchTicket && !launchHandled) await openLaunch();
     refreshSessions();
+  }
+
+  /** Sign in with a waiting OpsAPI link that asks for it (once). True when signed in; otherwise
+   *  a one-line reason for the sign-in screen, or null when the link doesn't ask. */
+  async function autoLogin() {
+    if (!launchTicket || launchHandled || autoLoginTried) return null;
+    autoLoginTried = true;
+    const c = launchClaims();
+    if (!c || !c.login) return null;
+    setStatus("Signing you in from OpsAPI…", "");
+    try {
+      await api("POST", "/api/launch/login", { ticket: launchTicket });
+      return true;
+    } catch (e) {
+      return "Couldn't sign you in automatically: " + e.message;
+    }
   }
 
   /** Open the tab an OpsAPI task link asks for (after sign-in; the server checks everything). */
