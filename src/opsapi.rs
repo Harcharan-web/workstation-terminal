@@ -498,6 +498,8 @@ pub fn find_agent<'a>(cfg: &'a OpsapiConfig, id: &str) -> Result<Option<&'a Agen
 pub struct LaunchTag {
     pub id: String,
     pub task: String,
+    /// The agent id from the link (`shell` for none).
+    pub agent: String,
 }
 
 /// What `/api/launch` accepted, waiting for (or used by) a terminal session.

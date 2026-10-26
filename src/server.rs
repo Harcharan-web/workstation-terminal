@@ -977,9 +977,29 @@ impl Running {
 }
 
 /// Start serving on an already-bound listener. `cfg.server.port` must match the listener.
-pub async fn start(cfg: Config, audit: Audit, listener: std::net::TcpListener) -> Result<Running> {
+pub async fn start(
+    mut cfg: Config,
+    audit: Audit,
+    listener: std::net::TcpListener,
+) -> Result<Running> {
     let addr = listener.local_addr()?;
     listener.set_nonblocking(true)?;
+    // Claude Code's telemetry comes in on loopback only, never on the public port. Bound before
+    // the state is built so tabs are told the port actually in use.
+    let otlp_listener = if cfg.opsapi.work_log.enabled {
+        let otlp = SocketAddr::from(([127, 0, 0, 1], cfg.opsapi.work_log.otlp_port));
+        let l = std::net::TcpListener::bind(otlp).with_context(|| {
+            format!(
+                "cannot listen on {otlp} for opsapi.work_log (another gateway on this Mac? \
+                 set opsapi.work_log.otlp_port)"
+            )
+        })?;
+        l.set_nonblocking(true)?;
+        cfg.opsapi.work_log.otlp_port = l.local_addr()?.port();
+        Some(tokio::net::TcpListener::from_std(l)?)
+    } else {
+        None
+    };
     let app = AppState::new(cfg, audit);
     let cfg = app.cfg.clone();
 
@@ -1052,6 +1072,25 @@ pub async fn start(cfg: Config, audit: Audit, listener: std::net::TcpListener) -
 
     if cfg.opsapi.keys.enabled() {
         tokio::spawn(sync_opsapi_keys(app.clone()));
+    }
+
+    if let (Some(l), Some(wl)) = (otlp_listener, app.sessions.work_log.clone()) {
+        let otlp = crate::worklog::otlp::router(wl.clone());
+        let stop = app.shutdown.clone();
+        tasks.push(tokio::spawn(async move {
+            let r = axum::serve(l, otlp)
+                .with_graceful_shutdown(async move { stop.cancelled().await })
+                .await;
+            if let Err(e) = r {
+                tracing::error!(error = %e, "work log telemetry receiver failed");
+            }
+        }));
+        // Awaited on shutdown, so the tabs' final state is sent.
+        tasks.push(tokio::spawn(crate::worklog::forward::activity_loop(
+            app.clone(),
+            wl.clone(),
+        )));
+        tokio::spawn(crate::worklog::forward::upload_loop(app.clone(), wl));
     }
 
     app.ready.store(true, Ordering::Relaxed);

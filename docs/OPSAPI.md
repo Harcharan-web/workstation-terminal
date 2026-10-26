@@ -202,6 +202,76 @@ used; only people the gateway's owner listed can be signed in, and only as the t
 mapped to. What it gives up: for those people, OpsAPI (and their mailbox) now stands in for their SSH
 key. List only people you'd hand a shell on this account to.
 
+## Work log
+
+Off by default. When it is on, this gateway tells OpsAPI what happens in each tab (one terminal
+session), so managers can see who worked on what. **Tell employees in writing before turning it on**:
+it keeps the text they give Claude and what their screen shows.
+
+| What | Recorded |
+|---|---|
+| Tab (local and remote) | terminal user and key fingerprint, sign-in (`key` / `opsapi_launch`), IP, the task link if any, folder, agent, opened/closed, how it ended, exit code, active seconds (counted every 10 s when there was input or output in the last 60 s), bytes in/out |
+| Claude Code (from its own OpenTelemetry) | each prompt's text (cut to 16 KiB), each model request (model, tokens, cost estimate, duration), tool results and decisions (tool, success, parameters cut to 8 KiB), API errors, lines added/removed, commits, pull requests. Codex, Cursor and plain shells send nothing here. |
+| Screen (local tabs) | the tab's **output**, what the screen shows, as an [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/) recording (`o` and `r` events). **Keystrokes are never recorded**, but what the terminal echoes back is on screen (passwords at a no-echo prompt aren't). |
+
+Claude's `user.email`, `user.account_uuid` and `organization.id` are dropped. OpsAPI keeps prompt and
+tool text 90 days and recordings 30 days (its side: `docs/AI_RUNNER_WEB_TERMINAL.md` §11).
+
+```yaml
+opsapi:
+  webhook_secret: "<from OpsAPI>"
+  keys:
+    terminal_id: "<this terminal's id in OpsAPI>"   # needed even without keys.url
+  work_log:
+    enabled: true
+    url: https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal
+    otlp_port: 7683      # loopback-only receiver for Claude's telemetry
+    record: true         # screen recordings of local tabs
+```
+
+How it works:
+
+- Each local tab's shell gets `SSHWEB_TAB_TOKEN` (32 random bytes, hex) and Claude's telemetry
+  settings: `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `OTEL_LOGS_EXPORTER=otlp`, `OTEL_METRICS_EXPORTER=otlp`,
+  `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`, `OTEL_EXPORTER_OTLP_{LOGS,METRICS}_ENDPOINT=http://127.0.0.1:<otlp_port>/v1/{logs,metrics}`,
+  `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <token>`, `OTEL_LOG_USER_PROMPTS=1`,
+  `OTEL_LOG_TOOL_DETAILS=1`, `OTEL_LOGS_EXPORT_INTERVAL=5000`, `OTEL_METRIC_EXPORT_INTERVAL=30000`.
+- The receiver listens on `127.0.0.1:<otlp_port>` only (plain HTTP, `POST /v1/logs` and
+  `/v1/metrics`, JSON only, 4 MiB per post, loopback `Host` only). The token names the tab; a post
+  without a known token is kept with `tab: null`, so tampering shows. A token stops working when its tab
+  ends. Only the `user_prompt`, `api_request`, `api_error`, `tool_result` and `tool_decision` events and
+  the `claude_code.{lines_of_code,commit,pull_request}.count` and `claude_code.active_time.total`
+  metrics are kept.
+- Every 10 s, when something is new, the gateway sends `POST {url}/activity` (`X-Opsapi-Terminal`,
+  `X-Opsapi-Signature: sha256=<hex HMAC of the body>`): tabs at open, at close and every 60 s while they
+  change, and the new events. While OpsAPI can't be reached they wait in memory (up to 20 000 events,
+  oldest dropped first) and are retried with backoff up to 5 minutes. A clean shutdown sends the tabs'
+  final state.
+- A recording part closes every 60 s or 1 MiB and when its tab ends, is gzipped to
+  `<state_dir>/recordings/<tab>-<part>.cast.gz` (0600), sent as `POST {url}/recordings`
+  (`X-Opsapi-Tab`, `X-Opsapi-Part`, `X-Opsapi-Final`, signature over `"<tab>\n<part>\n"` + body) and
+  deleted once OpsAPI has it. Parts left by an earlier run are sent at start. Recording goes on while no
+  browser is attached.
+- Audit events: `work_log_send_failed` (once per outage), `work_log_events_dropped` (with a count).
+
+### Claude's managed settings
+
+Someone in a tab can change its environment. On the shared account, install Claude Code's managed
+settings as an administrator, so telemetry can't be switched off; their `otelHeadersHelper` reads the
+tab's token:
+
+```sh
+sudo mkdir -p "/Library/Application Support/ClaudeCode" /usr/local/libexec
+sudo install -o root -g wheel -m 644 packaging/claude-managed-settings.json \
+  "/Library/Application Support/ClaudeCode/managed-settings.json"
+sudo install -o root -g wheel -m 755 packaging/sshweb-otel-headers /usr/local/libexec/sshweb-otel-headers
+```
+
+If `otlp_port` isn't 7683, change the two endpoints in the file. The settings apply to **every** Claude
+Code on this Mac: outside an sshweb tab the helper sends no token, so (while a gateway listens) that
+Claude's telemetry reaches OpsAPI as unattributed. Install them only on a Mac whose Claude users have all
+been told.
+
 ## A separate macOS account for task terminals
 
 Every terminal runs as the macOS account that runs `sshweb`, with that account's files, keys and tokens.
