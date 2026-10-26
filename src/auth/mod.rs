@@ -57,7 +57,8 @@ impl AuthService {
     pub fn new(cfg: &Config, audit: Arc<Audit>, metrics: Arc<Metrics>) -> Self {
         let rl = &cfg.rate_limit;
         Self {
-            keys: KeyStore::new(cfg.auth.authorized_keys.clone(), cfg.auth.min_rsa_bits),
+            keys: KeyStore::new(cfg.auth.authorized_keys.clone(), cfg.auth.min_rsa_bits)
+                .with_max_stale(cfg.opsapi.keys.max_stale_secs),
             challenges: ChallengeStore::new(Duration::from_secs(cfg.auth.challenge_ttl_secs)),
             logins: LoginStore::new(
                 Duration::from_secs(cfg.auth.session_ttl_secs),

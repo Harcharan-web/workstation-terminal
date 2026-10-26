@@ -12,6 +12,10 @@
 //! Only public keys are stored. A key may appear once; a user may have many keys.
 //! Revocation: delete or comment out the line (`sshweb keys revoke`). The file is re-read
 //! whenever it changes, and sessions authenticated with a removed key are terminated.
+//!
+//! Keys managers issue in OpsAPI (`opsapi.keys`) are fetched separately and merged in while the
+//! last good fetch is recent (`max_stale_secs`): `local` access only, never for a user that is in
+//! this file, and dropped at their expiry. Removing one there removes it here at the next fetch.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -80,7 +84,12 @@ pub struct AuthorizedKey {
     pub access: Access,
     pub key: PublicKey,
     pub fingerprint: String,
+    /// Line in the file; 0 for a key from OpsAPI.
     pub line: usize,
+    /// OpsAPI keys: the person's OpsAPI email (lower case), so a launch link can sign them in.
+    pub email: Option<String>,
+    /// OpsAPI keys: when the key stops working.
+    pub expires_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -210,6 +219,8 @@ pub fn parse_line(
         fingerprint: fingerprint(&key),
         key,
         line: line_no,
+        email: None,
+        expires_unix: None,
     }))
 }
 
@@ -254,6 +265,29 @@ impl AuthorizedKeys {
     pub fn by_fingerprint(&self, fp: &str) -> Option<&AuthorizedKey> {
         self.keys.iter().find(|k| k.fingerprint == fp)
     }
+
+    /// The user an OpsAPI-issued key belongs to, by the person's OpsAPI email (any case).
+    pub fn user_for_email(&self, email: &str) -> Option<&str> {
+        self.keys
+            .iter()
+            .find(|k| k.email.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(email)))
+            .map(|k| k.user.as_str())
+    }
+}
+
+/// The last key list fetched from OpsAPI.
+#[derive(Default)]
+struct Synced {
+    keys: Vec<AuthorizedKey>,
+    fetched_at: u64,
+    generated_at: u64,
+}
+
+/// What a new OpsAPI key list changed: (user, fingerprint) pairs.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SyncChange {
+    pub added: Vec<(String, String)>,
+    pub removed: Vec<(String, String)>,
 }
 
 /// Cached parse keyed by (mtime, size) of the file.
@@ -264,6 +298,8 @@ pub struct KeyStore {
     path: PathBuf,
     min_rsa_bits: usize,
     cache: Mutex<Option<CacheEntry>>,
+    synced: Mutex<Synced>,
+    max_stale_secs: u64,
 }
 
 impl KeyStore {
@@ -272,16 +308,85 @@ impl KeyStore {
             path,
             min_rsa_bits,
             cache: Mutex::new(None),
+            synced: Mutex::new(Synced::default()),
+            max_stale_secs: 900,
         }
+    }
+
+    /// Keys from OpsAPI stop counting this long after the last good fetch.
+    pub fn with_max_stale(mut self, secs: u64) -> Self {
+        self.max_stale_secs = secs;
+        self
+    }
+
+    pub fn min_rsa_bits(&self) -> usize {
+        self.min_rsa_bits
+    }
+
+    /// Replace the OpsAPI key list. A list older than the current one is refused, so a replayed
+    /// answer can't bring back a key that was removed since.
+    pub fn set_synced(
+        &self,
+        keys: Vec<AuthorizedKey>,
+        generated_at: u64,
+        now: u64,
+    ) -> Result<SyncChange, String> {
+        let mut s = self.synced.lock().unwrap();
+        if generated_at < s.generated_at {
+            return Err("OpsAPI sent an older key list than the last one".into());
+        }
+        let pairs = |ks: &[AuthorizedKey]| -> BTreeSet<(String, String)> {
+            ks.iter()
+                .map(|k| (k.user.clone(), k.fingerprint.clone()))
+                .collect()
+        };
+        let (before, after) = (pairs(&s.keys), pairs(&keys));
+        let change = SyncChange {
+            added: after.difference(&before).cloned().collect(),
+            removed: before.difference(&after).cloned().collect(),
+        };
+        *s = Synced {
+            keys,
+            fetched_at: now,
+            generated_at,
+        };
+        Ok(change)
+    }
+
+    /// True when OpsAPI keys exist but the last good fetch is too old for them to count.
+    pub fn synced_stale(&self, now: u64) -> bool {
+        let s = self.synced.lock().unwrap();
+        !s.keys.is_empty() && now.saturating_sub(s.fetched_at) > self.max_stale_secs
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Current keys. If the file is missing, unsafe or malformed, an error is returned and
-    /// no key is accepted (fail closed).
+    /// Current keys: the file's, plus OpsAPI's while fresh. If the file is missing, unsafe or
+    /// malformed, an error is returned and no key is accepted (fail closed).
     pub fn current(&self) -> Result<Arc<AuthorizedKeys>, String> {
+        let file = self.current_file()?;
+        let now = crate::opsapi::unix_now();
+        let s = self.synced.lock().unwrap();
+        if s.keys.is_empty() || now.saturating_sub(s.fetched_at) > self.max_stale_secs {
+            return Ok(file);
+        }
+        let mut keys = file.keys.clone();
+        for k in &s.keys {
+            // A user or key in the file belongs to the administrator: OpsAPI can't take it over.
+            let clash = file
+                .keys
+                .iter()
+                .any(|f| f.user == k.user || f.key.key_data() == k.key.key_data());
+            if !clash && k.expires_unix.is_none_or(|e| e > now) {
+                keys.push(k.clone());
+            }
+        }
+        Ok(Arc::new(AuthorizedKeys { keys }))
+    }
+
+    fn current_file(&self) -> Result<Arc<AuthorizedKeys>, String> {
         crate::security::perms::check_admin_file(&self.path)?;
         let md = std::fs::metadata(&self.path).map_err(|e| e.to_string())?;
         let stamp = (md.modified().ok(), md.len());
@@ -400,5 +505,64 @@ mod tests {
         assert!(ks.current().is_err());
         std::fs::write(&p, "# empty\n").unwrap();
         assert_eq!(ks.current().unwrap().keys.len(), 0);
+    }
+
+    fn opsapi_key(user: &str, seed: u8, expires_unix: u64) -> AuthorizedKey {
+        let key = PublicKey::from(KeyData::Ed25519(ssh_key::public::Ed25519PublicKey([seed; 32])));
+        AuthorizedKey {
+            user: user.into(),
+            access: Access {
+                local: true,
+                ..Access::default()
+            },
+            fingerprint: fingerprint(&key),
+            key,
+            line: 0,
+            email: Some(format!("{user}@example.com")),
+            expires_unix: Some(expires_unix),
+        }
+    }
+
+    #[test]
+    fn opsapi_keys_merge_but_never_take_over_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ak");
+        crate::security::perms::write_new_file(
+            &p,
+            format!("user=\"a\",access=\"local,remote:*\" {ED}\n").as_bytes(),
+            0o600,
+            false,
+        )
+        .unwrap();
+        let ks = KeyStore::new(p, 2048).with_max_stale(900);
+        let now = crate::opsapi::unix_now();
+        let file_key = ks.current().unwrap().keys[0].clone();
+        let mut copies_file_key = opsapi_key("bob", 1, now + 3600);
+        copies_file_key.key = file_key.key.clone();
+        copies_file_key.fingerprint = file_key.fingerprint.clone();
+        let list = vec![
+            opsapi_key("priya", 2, now + 3600),
+            opsapi_key("a", 3, now + 3600), // the file's user: ignored
+            copies_file_key,                // the file's key: ignored
+            opsapi_key("old", 4, now - 1),  // expired: ignored
+        ];
+        let change = ks.set_synced(list, 100, now).unwrap();
+        assert_eq!(change.added.len(), 4);
+        let keys = ks.current().unwrap();
+        let users: Vec<&str> = keys.keys.iter().map(|k| k.user.as_str()).collect();
+        assert_eq!(users, ["a", "priya"]);
+        assert_eq!(keys.user_for_email("PRIYA@example.com"), Some("priya"));
+        assert_eq!(keys.user_for_email("a@example.com"), None);
+
+        assert!(ks.set_synced(vec![], 99, now).is_err(), "an older list is refused");
+        let change = ks.set_synced(vec![], 101, now).unwrap();
+        assert_eq!(change.removed.len(), 4);
+        assert_eq!(ks.current().unwrap().keys.len(), 1);
+
+        // No good fetch for longer than max_stale: OpsAPI's keys stop, the file's keep working.
+        ks.set_synced(vec![opsapi_key("priya", 2, now + 3600)], 102, now - 1000)
+            .unwrap();
+        assert!(ks.synced_stale(now));
+        assert_eq!(ks.current().unwrap().keys.len(), 1);
     }
 }

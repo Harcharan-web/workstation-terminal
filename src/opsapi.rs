@@ -26,7 +26,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
+use crate::auth::keys::{
+    Access, AuthorizedKey, AuthorizedKeys, check_key_strength, fingerprint, valid_user,
+};
 use crate::config::{AgentConfig, AutologinConfig, Config, OpsapiConfig};
+use ssh_key::PublicKey;
 
 /// Longest lifetime OpsAPI may give a link (it uses 15 minutes).
 pub const MAX_LINK_LIFETIME_SECS: u64 = 3600;
@@ -48,7 +52,7 @@ fn valid_uuidish(s: &str) -> bool {
 }
 
 /// A canonical UUID: 8-4-4-4-12 hex digits.
-fn valid_uuid(s: &str) -> bool {
+pub fn valid_uuid(s: &str) -> bool {
     let groups: Vec<&str> = s.split('-').collect();
     groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
         && groups
@@ -282,11 +286,12 @@ impl LinkError {
 /// The terminal user a verified link may sign in (§8), before the key check: the link carries
 /// `login` and lives at most 120 s, auto sign-in is on, the email is mapped, and the step-up is
 /// no later than the link and no older than `max_stepup_age_secs`.
-pub fn autologin_user<'a>(
-    cfg: &'a AutologinConfig,
+pub fn autologin_user(
+    cfg: &AutologinConfig,
+    keys: &AuthorizedKeys,
     launch: &Launch,
     now: u64,
-) -> Result<&'a str, AutologinError> {
+) -> Result<String, AutologinError> {
     if !cfg.enabled {
         return Err(AutologinError::Off);
     }
@@ -294,13 +299,149 @@ pub fn autologin_user<'a>(
     if launch.exp - launch.iat > MAX_LOGIN_LINK_LIFETIME_SECS || login.stepup > launch.iat {
         return Err(AutologinError::Link(LinkError::Invalid));
     }
+    // The config's own list first, then the people OpsAPI issued keys to (by their email).
     let user = cfg
         .user_for(&login.email)
-        .ok_or(AutologinError::NotAllowed)?;
+        .or_else(|| keys.user_for_email(&login.email))
+        .ok_or(AutologinError::NotAllowed)?
+        .to_string();
     if now.saturating_sub(login.stepup) > cfg.max_stepup_age_secs {
         return Err(AutologinError::StepupStale);
     }
     Ok(user)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Keys issued in OpsAPI (`opsapi.keys`, §10 of the OpsAPI doc)
+// ---------------------------------------------------------------------------------------------
+
+/// Largest key list accepted from OpsAPI.
+const MAX_KEYS_BODY: usize = 1024 * 1024;
+
+#[derive(Deserialize)]
+struct KeysAnswer {
+    terminal: String,
+    generated_at: u64,
+    keys: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct KeyEntry {
+    user: String,
+    public_key: String,
+    expires_unix: u64,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+/// Check OpsAPI's answer and turn it into keys: it must be signed with the shared secret
+/// (`X-Opsapi-Signature: sha256=<hex HMAC of the body>`), name this terminal and be recent.
+/// Entries that aren't valid, or have expired, are left out. Keys get `local` access only.
+pub fn parse_keys_answer(
+    secret: &str,
+    terminal_id: &str,
+    body: &[u8],
+    signature: &str,
+    now: u64,
+    min_rsa_bits: usize,
+) -> Result<(u64, Vec<AuthorizedKey>), String> {
+    let sig = signature
+        .strip_prefix("sha256=")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !crate::security::ct_eq(hmac_sha256_hex(secret, body).as_bytes(), sig.as_bytes()) {
+        return Err("the key list isn't signed with this terminal's secret".into());
+    }
+    let a: KeysAnswer = serde_json::from_slice(body).map_err(|e| format!("bad key list: {e}"))?;
+    if !a.terminal.eq_ignore_ascii_case(terminal_id) {
+        return Err("the key list is for another terminal".into());
+    }
+    if a.generated_at.abs_diff(now) > CLOCK_SKEW_SECS {
+        return Err("the key list is too old (or this machine's clock is off)".into());
+    }
+    let mut keys: Vec<AuthorizedKey> = Vec::new();
+    for v in a.keys {
+        let Ok(e) = serde_json::from_value::<KeyEntry>(v) else {
+            warn!("opsapi key list: an entry isn't valid; skipped");
+            continue;
+        };
+        let email = e.email.map(|m| m.to_ascii_lowercase());
+        let key = match PublicKey::from_openssh(&e.public_key) {
+            Ok(k) if check_key_strength(k.key_data(), min_rsa_bits).is_ok() => k,
+            _ => {
+                warn!(user = %e.user, "opsapi key list: a key isn't valid; skipped");
+                continue;
+            }
+        };
+        let fingerprint = fingerprint(&key);
+        if !valid_user(&e.user)
+            || e.expires_unix <= now
+            || email.as_deref().is_some_and(|m| !valid_email(m))
+            || keys.iter().any(|k| k.user == e.user || k.fingerprint == fingerprint)
+        {
+            warn!(user = %e.user, "opsapi key list: an entry isn't valid; skipped");
+            continue;
+        }
+        keys.push(AuthorizedKey {
+            user: e.user,
+            access: Access {
+                local: true,
+                ..Access::default()
+            },
+            key,
+            fingerprint,
+            line: 0,
+            email,
+            expires_unix: Some(e.expires_unix),
+        });
+    }
+    Ok((a.generated_at, keys))
+}
+
+/// Fetch this terminal's keys from OpsAPI. The request is signed:
+/// `X-Opsapi-Signature: sha256=<hex HMAC of "keys\n<terminal id>\n<X-Opsapi-Timestamp>">`.
+pub async fn fetch_keys(cfg: &Config, now: u64) -> Result<(u64, Vec<AuthorizedKey>), String> {
+    let k = &cfg.opsapi.keys;
+    let (Some(url), Some(term), Some(secret)) = (
+        k.url.as_deref(),
+        k.terminal_id.as_deref().map(str::to_ascii_lowercase),
+        cfg.opsapi.webhook_secret.as_deref(),
+    ) else {
+        return Err("opsapi.keys isn't configured".into());
+    };
+    let ts = now.to_string();
+    let sig = hmac_sha256_hex(secret, format!("keys\n{term}\n{ts}").as_bytes());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let res = client
+        .get(url)
+        .header("X-Opsapi-Terminal", &term)
+        .header("X-Opsapi-Timestamp", &ts)
+        .header("X-Opsapi-Signature", format!("sha256={sig}"))
+        .header("User-Agent", "sshweb-opsapi-keys")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        return Err(format!("status {}", res.status()));
+    }
+    if res.content_length().is_some_and(|n| n > MAX_KEYS_BODY as u64) {
+        return Err("key list too large".into());
+    }
+    let signature = res
+        .headers()
+        .get("x-opsapi-signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = res.bytes().await.map_err(|e| e.to_string())?;
+    if body.len() > MAX_KEYS_BODY {
+        return Err("key list too large".into());
+    }
+    parse_keys_answer(secret, &term, &body, &signature, now, cfg.auth.min_rsa_bits)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -867,7 +1008,7 @@ pub mod tests {
         let cfg = autologin_cfg();
         let check = |c: serde_json::Value, cfg: &AutologinConfig, at: u64| {
             let l = verify_ticket(SECRET, &mint(SECRET, c), now).unwrap();
-            autologin_user(cfg, &l, at).map(str::to_string)
+            autologin_user(cfg, &AuthorizedKeys::default(), &l, at)
         };
         assert_eq!(
             check(login_claims(now), &cfg, now),
@@ -943,5 +1084,89 @@ pub mod tests {
         let plain = verify_ticket(SECRET, &mint(SECRET, claims(now, "/srv/x")), now).unwrap();
         let env: HashMap<_, _> = launch_env(&plain).into_iter().collect();
         assert!(!env.contains_key("OPSAPI_REPORT_URL") && !env.contains_key("OPSAPI_REPORT_TOKEN"));
+    }
+
+    const TERM: &str = "6f1c2a9e-1111-4c4c-9d9d-0123456789ab";
+
+    fn ed_line(seed: u8) -> String {
+        PublicKey::from(ssh_key::public::KeyData::Ed25519(
+            ssh_key::public::Ed25519PublicKey([seed; 32]),
+        ))
+        .to_openssh()
+        .unwrap()
+    }
+
+    fn keys_answer(generated_at: u64, keys: serde_json::Value) -> (Vec<u8>, String) {
+        let body = json!({"terminal": TERM, "generated_at": generated_at, "keys": keys})
+            .to_string()
+            .into_bytes();
+        let sig = format!("sha256={}", hmac_sha256_hex(SECRET, &body));
+        (body, sig)
+    }
+
+    #[test]
+    fn opsapi_key_list_must_be_signed_for_this_terminal_and_recent() {
+        let now = 1_800_000_000;
+        let (body, sig) = keys_answer(
+            now,
+            json!([
+                {"user": "priya", "public_key": ed_line(1), "expires_unix": now + 3600, "email": "Priya@Example.com"},
+                {"user": "Bad User", "public_key": ed_line(2), "expires_unix": now + 3600},
+                {"user": "gone", "public_key": ed_line(3), "expires_unix": now - 1},
+                {"user": "junk", "public_key": "ssh-ed25519 not-a-key", "expires_unix": now + 3600},
+                {"user": "priya", "public_key": ed_line(4), "expires_unix": now + 3600},
+                {"oops": true}
+            ]),
+        );
+        let (at, keys) = parse_keys_answer(SECRET, TERM, &body, &sig, now, 2048).unwrap();
+        assert_eq!(at, now);
+        assert_eq!(keys.len(), 1, "only the valid, unexpired, first entry for a user");
+        let k = &keys[0];
+        assert_eq!(
+            (k.user.as_str(), k.email.as_deref(), k.expires_unix),
+            ("priya", Some("priya@example.com"), Some(now + 3600))
+        );
+        assert!(k.access.local && !k.access.allows_any_remote(), "local only");
+        assert!(parse_keys_answer(SECRET, &TERM.to_uppercase(), &body, &sig, now, 2048).is_ok());
+
+        let tampered = String::from_utf8(body.clone())
+            .unwrap()
+            .replace("1800003600", "1800999999")
+            .into_bytes();
+        let other_secret = "another-secret-0123456789abcdef0123456789";
+        for (secret, term, body, sig, at) in [
+            (SECRET, TERM, &body, "sha256=00", now),
+            (SECRET, TERM, &body, "", now),
+            (other_secret, TERM, &body, sig.as_str(), now),
+            (SECRET, TERM, &tampered, sig.as_str(), now),
+            (SECRET, "00000000-0000-4000-8000-000000000000", &body, sig.as_str(), now),
+            (SECRET, TERM, &body, sig.as_str(), now + 3600),
+        ] {
+            assert!(parse_keys_answer(secret, term, body, sig, at, 2048).is_err());
+        }
+    }
+
+    #[test]
+    fn autologin_finds_people_opsapi_issued_keys_to_by_email() {
+        let now = 1_800_000_000;
+        let cfg = AutologinConfig {
+            enabled: true,
+            max_stepup_age_secs: 43200,
+            users: Default::default(),
+        };
+        let (body, sig) = keys_answer(
+            now,
+            json!([{"user": "alice", "public_key": ed_line(1), "expires_unix": now + 3600,
+                    "email": "alice@example.com"}]),
+        );
+        let keys = AuthorizedKeys {
+            keys: parse_keys_answer(SECRET, TERM, &body, &sig, now, 2048).unwrap().1,
+        };
+        let l = verify_ticket(SECRET, &mint(SECRET, login_claims(now)), now).unwrap();
+        assert_eq!(autologin_user(&cfg, &keys, &l, now), Ok("alice".into()));
+        assert_eq!(
+            autologin_user(&cfg, &AuthorizedKeys::default(), &l, now),
+            Err(AutologinError::NotAllowed)
+        );
     }
 }

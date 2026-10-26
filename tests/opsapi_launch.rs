@@ -217,8 +217,9 @@ async fn bad_links_are_refused() {
         site_s,
         "echo",
     ));
-    forged.pop();
-    forged.push('0');
+    // Change the signature's last digit (to one it isn't, or the "forgery" is the real link).
+    let last = forged.pop().unwrap();
+    forged.push(if last == '0' { '1' } else { '0' });
     for (ticket, code) in [
         (forged, "invalid_link"),
         (
@@ -502,8 +503,8 @@ async fn links_that_may_not_sign_in_are_refused() {
         mint(&c)
     };
     let mut forged = with(1, &|_| {});
-    forged.pop();
-    forged.push(if forged.ends_with('0') { '1' } else { '0' });
+    let last = forged.pop().unwrap();
+    forged.push(if last == '0' { '1' } else { '0' });
     for (ticket, status, code) in [
         (forged, 400, "invalid_link"),
         (
