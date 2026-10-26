@@ -200,6 +200,8 @@ OpsAPI can open a task straight into a tab here: a folder under `local.allowed_r
 starts and ends. Links are signed, expire, work once and never sign anyone in. Task tabs stay alive while
 the agent works (output counts as activity). Setup, the contract and running task terminals under a
 separate macOS account: [docs/OPSAPI.md](docs/OPSAPI.md).
+An optional work log (off by default) sends OpsAPI each tab's record, Claude Code's prompts and usage,
+and a recording of what the screen showed (never keystrokes): [docs/OPSAPI.md](docs/OPSAPI.md#work-log).
 
 ## Tabs and resuming
 

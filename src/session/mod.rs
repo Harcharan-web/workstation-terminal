@@ -138,6 +138,8 @@ pub struct TerminalSession {
     /// The OpsAPI launch this session was opened from. Task sessions follow the `opsapi`
     /// keep-alive limits and report start/end to OpsAPI.
     pub launch: Option<crate::opsapi::LaunchTag>,
+    /// This session in the OpsAPI work log (`opsapi.work_log`).
+    work: Option<Arc<crate::worklog::Tab>>,
     pty: PtyProcess,
     name: Mutex<Option<String>>,
     scrollback: Mutex<Scrollback>,
@@ -189,11 +191,18 @@ impl TerminalSession {
         }
         *self.last_input.lock().unwrap() = Instant::now();
         self.metrics.add(&self.metrics.bytes_in, data.len() as u64);
+        if let Some(t) = &self.work {
+            t.input(data.len());
+        }
         self.pty.write(data).await
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
-        self.pty.resize(cols, rows)
+        self.pty.resize(cols, rows)?;
+        if let Some(t) = &self.work {
+            t.resize(cols, rows);
+        }
+        Ok(())
     }
 
     pub fn pid(&self) -> Option<i32> {
@@ -282,11 +291,14 @@ pub struct SessionManager {
     metrics: Arc<Metrics>,
     shutting_down: CancellationToken,
     next_conn: AtomicU64,
+    /// The OpsAPI work log, when `opsapi.work_log.enabled`.
+    pub work_log: Option<Arc<crate::worklog::WorkLog>>,
 }
 
 impl SessionManager {
     pub fn new(cfg: Arc<Config>, audit: Arc<Audit>, metrics: Arc<Metrics>) -> Arc<Self> {
         Arc::new(Self {
+            work_log: crate::worklog::WorkLog::new(&cfg, audit.clone()),
             cfg,
             sessions: Mutex::new(HashMap::new()),
             audit,
@@ -308,7 +320,7 @@ impl SessionManager {
         self: &Arc<Self>,
         login: &Login,
         target: Target,
-        spec: PtySpec,
+        mut spec: PtySpec,
         name: Option<String>,
         launch: Option<crate::opsapi::LaunchTag>,
     ) -> Result<Arc<TerminalSession>, OpenError> {
@@ -323,12 +335,19 @@ impl SessionManager {
         if map.values().filter(|x| x.user == login.user).count() >= s.max_per_user {
             return Err(OpenError::UserLimit(s.max_per_user));
         }
+        let id = crate::security::random_id();
+        // A local tab's shell gets its work log token and Claude's telemetry settings.
+        let work = self.work_log.as_ref().map(|w| {
+            let (tab, env) = w.new_tab(&id, login, &target, &spec, launch.as_ref());
+            spec.env.extend(env);
+            tab
+        });
         let (pty, out_rx) = PtyProcess::spawn(&spec).map_err(|e| {
             self.metrics.inc(&self.metrics.session_open_failures);
             OpenError::Spawn(format!("{e:#}"))
         })?;
         let sess = Arc::new(TerminalSession {
-            id: crate::security::random_id(),
+            id,
             user: login.user.clone(),
             owner: Mutex::new(Owner {
                 login_id: login.id.clone(),
@@ -338,6 +357,7 @@ impl SessionManager {
             target,
             created_unix: unix_now(),
             launch,
+            work,
             pty,
             scrollback: Mutex::new(Scrollback {
                 buf: VecDeque::new(),
@@ -354,6 +374,9 @@ impl SessionManager {
         });
         map.insert(sess.id.clone(), sess.clone());
         drop(map);
+        if let (Some(w), Some(t)) = (&self.work_log, &sess.work) {
+            w.register(t);
+        }
 
         match &sess.target {
             Target::Local { .. } => self.metrics.inc(&self.metrics.sessions_opened_local),
@@ -447,6 +470,10 @@ impl SessionManager {
     async fn forward_output(&self, sess: &TerminalSession, b: Bytes) {
         self.metrics.add(&self.metrics.bytes_out, b.len() as u64);
         *sess.last_output.lock().unwrap() = Instant::now();
+        // Recorded whether or not a browser is attached.
+        if let Some(t) = &sess.work {
+            t.output(&b);
+        }
         // Lock order (attached, then scrollback) matches attach(), so a re-attach sees each
         // chunk exactly once: either in the snapshot or as a live event.
         let target = {
@@ -458,6 +485,9 @@ impl SessionManager {
     }
 
     async fn finish(&self, sess: &Arc<TerminalSession>, reason: String, exit_code: Option<u32>) {
+        if let (Some(w), Some(t)) = (&self.work_log, &sess.work) {
+            w.close_tab(t, &reason, exit_code);
+        }
         self.sessions.lock().unwrap().remove(&sess.id);
         self.metrics.gauge_add(&self.metrics.sessions_active, -1);
         if matches!(sess.target, Target::Remote(_)) && exit_code == Some(255) {
@@ -841,6 +871,7 @@ mod tests {
             Some(crate::opsapi::LaunchTag {
                 id: "l1".into(),
                 task: "t1".into(),
+                agent: "shell".into(),
             })
         };
         let a = login("a");

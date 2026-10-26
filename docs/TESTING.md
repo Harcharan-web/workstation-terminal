@@ -35,6 +35,7 @@ All tests use temporary directories and generated throwaway keys. No real creden
 | Malformed and oversized input | `malformed_and_oversized_requests`, `oversized_message_closes_connection`, `too_many_protocol_errors_close_the_socket` |
 | Graceful shutdown | `graceful_shutdown_closes_sessions_and_sockets`, `limits_enforced` |
 | TLS | `https_mode_sets_secure_cookies_and_hsts` |
+| OpsAPI work log | `worklog::*::tests` (OTLP filtering, recording parts, batches, signatures), `work_log.rs` (tab token → receiver → signed `/activity` and `/recordings`) |
 
 ## Manual browser test procedure
 

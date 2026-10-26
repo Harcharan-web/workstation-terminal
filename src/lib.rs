@@ -14,4 +14,5 @@ pub mod session;
 pub mod ssh;
 pub mod terminal;
 pub mod websocket;
+pub mod worklog;
 pub mod workspace;

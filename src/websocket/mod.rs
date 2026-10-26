@@ -494,6 +494,7 @@ impl Conn {
                 let tag = claimed.as_ref().map(|p| crate::opsapi::LaunchTag {
                     id: p.launch.id.clone(),
                     task: p.launch.task.clone(),
+                    agent: p.launch.agent.clone(),
                 });
                 match app.sessions.open(&login, target, spec, name, tag) {
                     Ok(s) => {

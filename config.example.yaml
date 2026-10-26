@@ -122,3 +122,9 @@ logging:
 #     terminal_id: "<this terminal's id in OpsAPI>"
 #     interval_secs: 30          # fetched this often; a blocked key stops at the next fetch
 #     max_stale_secs: 900        # no good fetch for this long: OpsAPI's keys stop (this file's keep working)
+#   work_log:                  # tabs, Claude Code telemetry and screen recordings sent to OpsAPI
+#     enabled: false             # needs keys.terminal_id and webhook_secret; tell employees first
+#     url: https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal
+#     otlp_port: 7683            # loopback-only receiver for Claude's telemetry (127.0.0.1)
+#     record: true               # record each local tab's output (never its input)
+#     max_pending_mb: 2048       # recordings waiting for upload; over this, new parts are skipped

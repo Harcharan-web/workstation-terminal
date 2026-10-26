@@ -1,0 +1,15 @@
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_METRICS_EXPORTER": "otlp",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://127.0.0.1:7683/v1/logs",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://127.0.0.1:7683/v1/metrics",
+    "OTEL_LOG_USER_PROMPTS": "1",
+    "OTEL_LOG_TOOL_DETAILS": "1",
+    "OTEL_LOGS_EXPORT_INTERVAL": "5000",
+    "OTEL_METRIC_EXPORT_INTERVAL": "30000"
+  },
+  "otelHeadersHelper": "/usr/local/libexec/sshweb-otel-headers"
+}

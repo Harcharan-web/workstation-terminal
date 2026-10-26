@@ -46,6 +46,35 @@ pub struct OpsapiConfig {
     pub autologin: AutologinConfig,
     /// Keys managers issue people in OpsAPI, fetched from it (off unless `url` is set).
     pub keys: OpsapiKeysConfig,
+    /// Work log sent to OpsAPI: tabs, Claude Code telemetry, screen recordings (off by default).
+    pub work_log: WorkLogConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkLogConfig {
+    pub enabled: bool,
+    /// Base URL; `/activity` and `/recordings` are appended.
+    /// e.g. https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal
+    pub url: Option<String>,
+    /// Loopback-only plain-HTTP receiver for Claude Code's telemetry (0 picks a free port).
+    pub otlp_port: u16,
+    /// Record each local tab's output (never its input).
+    pub record: bool,
+    /// New recording parts are skipped (a gap) while this much waits for upload.
+    pub max_pending_mb: u64,
+}
+
+impl Default for WorkLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: None,
+            otlp_port: 7683,
+            record: true,
+            max_pending_mb: 2048,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +343,7 @@ impl Default for OpsapiConfig {
             detach_grace_secs: 4 * 3600,
             autologin: AutologinConfig::default(),
             keys: OpsapiKeysConfig::default(),
+            work_log: WorkLogConfig::default(),
         }
     }
 }
@@ -738,14 +768,8 @@ impl Config {
         }
         let k = &o.keys;
         if k.enabled() {
-            let url = k.url.as_deref().unwrap_or("");
             // Keys grant shells: only over TLS, except to OpsAPI on this machine for development.
-            if !(url.starts_with("https://")
-                || url.starts_with("http://localhost:")
-                || url.starts_with("http://localhost/")
-                || url.starts_with("http://127.0.0.1:")
-                || url.starts_with("http://127.0.0.1/"))
-            {
+            if !tls_or_this_machine(k.url.as_deref().unwrap_or("")) {
                 errs.push("opsapi.keys.url must be https (or http://localhost / 127.0.0.1)".into());
             }
             if !k
@@ -763,6 +787,27 @@ impl Config {
                     "opsapi.keys: interval_secs must be positive and max_stale_secs at least twice it"
                         .into(),
                 );
+            }
+        }
+        let w = &o.work_log;
+        if w.enabled {
+            if !w.url.as_deref().is_some_and(tls_or_this_machine) {
+                errs.push(
+                    "opsapi.work_log.url must be https (or http://localhost / 127.0.0.1)".into(),
+                );
+            }
+            if !k
+                .terminal_id
+                .as_deref()
+                .is_some_and(crate::opsapi::valid_uuid)
+            {
+                errs.push("opsapi.work_log needs opsapi.keys.terminal_id".into());
+            }
+            if o.webhook_secret.as_deref().unwrap_or("").is_empty() {
+                errs.push("opsapi.work_log needs opsapi.webhook_secret".into());
+            }
+            if w.max_pending_mb == 0 {
+                errs.push("opsapi.work_log.max_pending_mb must be positive".into());
             }
         }
         let al = &o.autologin;
@@ -953,6 +998,19 @@ impl Config {
     }
 }
 
+/// An https URL, or plain http to OpsAPI on this machine (development).
+fn tls_or_this_machine(url: &str) -> bool {
+    [
+        "https://",
+        "http://localhost:",
+        "http://localhost/",
+        "http://127.0.0.1:",
+        "http://127.0.0.1/",
+    ]
+    .iter()
+    .any(|p| url.starts_with(p))
+}
+
 /// The sample configuration written by `sshweb config init`.
 pub const SAMPLE_CONFIG: &str = include_str!("../config.example.yaml");
 
@@ -1010,6 +1068,37 @@ mod tests {
             assert!(errs.contains(want), "{want}: {errs}");
         }
         assert!(Config::from_yaml("opsapi:\n  autologin:\n    enable: true\n").is_err());
+    }
+
+    #[test]
+    fn work_log_is_off_by_default_and_validated() {
+        let c = Config::default();
+        assert!(!c.opsapi.work_log.enabled);
+        assert_eq!(c.opsapi.work_log.otlp_port, 7683);
+        assert!(c.opsapi.work_log.record);
+        assert_eq!(c.opsapi.work_log.max_pending_mb, 2048);
+        let c = Config::from_yaml(
+            "opsapi:\n  webhook_secret: \"0123456789abcdef0123456789abcdef\"\n  keys:\n    \
+             terminal_id: 6f1c2a9e-1111-4c4c-9d9d-0123456789ab\n  work_log:\n    \
+             enabled: true\n    url: https://ops.example/api/v2/ai-runner/public/terminal\n",
+        )
+        .unwrap();
+        assert!(c.validate_static().is_empty(), "{:?}", c.validate_static());
+        let bad = Config::from_yaml(
+            "opsapi:\n  work_log:\n    enabled: true\n    url: http://ops.example/terminal\n    \
+             max_pending_mb: 0\n",
+        )
+        .unwrap();
+        let errs = bad.validate_static().join("\n");
+        for want in [
+            "work_log.url must be https",
+            "terminal_id",
+            "webhook_secret",
+            "max_pending_mb",
+        ] {
+            assert!(errs.contains(want), "{want}: {errs}");
+        }
+        assert!(Config::from_yaml("opsapi:\n  work_log:\n    recrd: true\n").is_err());
     }
 
     #[test]
