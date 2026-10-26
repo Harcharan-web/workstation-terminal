@@ -44,6 +44,39 @@ pub struct OpsapiConfig {
     pub detach_grace_secs: u64,
     /// Let OpsAPI sign chosen people in with a launch link (off by default).
     pub autologin: AutologinConfig,
+    /// Keys managers issue people in OpsAPI, fetched from it (off unless `url` is set).
+    pub keys: OpsapiKeysConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpsapiKeysConfig {
+    /// e.g. https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal/keys
+    pub url: Option<String>,
+    /// This terminal's id in OpsAPI (shown in its config block).
+    pub terminal_id: Option<String>,
+    /// How often to fetch the list.
+    pub interval_secs: u64,
+    /// Without a good fetch for this long, the keys from OpsAPI stop working (fail closed); keys in
+    /// `authorized_keys` keep working.
+    pub max_stale_secs: u64,
+}
+
+impl Default for OpsapiKeysConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            terminal_id: None,
+            interval_secs: 30,
+            max_stale_secs: 900,
+        }
+    }
+}
+
+impl OpsapiKeysConfig {
+    pub fn enabled(&self) -> bool {
+        self.url.as_deref().is_some_and(|u| !u.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +313,7 @@ impl Default for OpsapiConfig {
             idle_timeout_secs: 4 * 3600,
             detach_grace_secs: 4 * 3600,
             autologin: AutologinConfig::default(),
+            keys: OpsapiKeysConfig::default(),
         }
     }
 }
@@ -700,6 +734,35 @@ impl Config {
                     "opsapi agent {:?}: run must be one line of at most 1024 characters",
                     a.id
                 ));
+            }
+        }
+        let k = &o.keys;
+        if k.enabled() {
+            let url = k.url.as_deref().unwrap_or("");
+            // Keys grant shells: only over TLS, except to OpsAPI on this machine for development.
+            if !(url.starts_with("https://")
+                || url.starts_with("http://localhost:")
+                || url.starts_with("http://localhost/")
+                || url.starts_with("http://127.0.0.1:")
+                || url.starts_with("http://127.0.0.1/"))
+            {
+                errs.push("opsapi.keys.url must be https (or http://localhost / 127.0.0.1)".into());
+            }
+            if !k
+                .terminal_id
+                .as_deref()
+                .is_some_and(crate::opsapi::valid_uuid)
+            {
+                errs.push("opsapi.keys.terminal_id must be the terminal's id from OpsAPI".into());
+            }
+            if o.webhook_secret.as_deref().unwrap_or("").is_empty() {
+                errs.push("opsapi.keys needs opsapi.webhook_secret".into());
+            }
+            if k.interval_secs == 0 || k.max_stale_secs < k.interval_secs.saturating_mul(2) {
+                errs.push(
+                    "opsapi.keys: interval_secs must be positive and max_stale_secs at least twice it"
+                        .into(),
+                );
             }
         }
         let al = &o.autologin;

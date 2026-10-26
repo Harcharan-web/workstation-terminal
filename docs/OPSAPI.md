@@ -101,6 +101,39 @@ curl -fsS -X POST "$OPSAPI_REPORT_URL" -H "Authorization: Bearer $OPSAPI_REPORT_
 
 The token can only attach pull requests and notes to its own task. The gateway never logs it.
 
+## Keys issued in OpsAPI
+
+Managers can give each person their own key from OpsAPI (AI Runs → Machines → Web terminals → People), so
+nobody signs in as someone else and nobody needs to be added on this machine by hand. The key pair is made in
+the manager's browser; OpsAPI keeps only the public half. The manager hands the person the key file and its
+passphrase; they sign in here with it like any key.
+
+```yaml
+opsapi:
+  keys:
+    url: https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal/keys
+    terminal_id: "<this terminal's id in OpsAPI>"   # OpsAPI's config block has both lines
+    interval_secs: 30
+    max_stale_secs: 900
+```
+
+The gateway fetches the list now and every `interval_secs`. The request is signed with the shared secret
+(`X-Opsapi-Signature: sha256=<hex HMAC of "keys\n<terminal id>\n<timestamp>">`, `X-Opsapi-Timestamp`,
+`X-Opsapi-Terminal`), and the answer is only trusted when its own `X-Opsapi-Signature` (HMAC of the body)
+checks out, it names this terminal, it is less than 5 minutes old and no older than the last list taken.
+Then:
+
+- OpsAPI keys get `local` access only, and are dropped at their expiry (90 days after issue).
+- They never take over this machine's own `authorized_keys`: a user name or key that is in the file is
+  ignored in the list, so the owner's account can't be claimed from OpsAPI.
+- A key that leaves the list (blocked, expired, the person left the workspace) stops at once, and its
+  sessions close within seconds, as with `sshweb keys revoke`.
+- Without a good fetch for `max_stale_secs`, all OpsAPI keys stop working (fail closed); keys in the file
+  keep working, so the owner can still sign in.
+- Audit events: `opsapi_key_added`, `opsapi_key_removed` (user and fingerprint), `opsapi_keys_stale`;
+  sign-ins as before (`auth_success` with the user and key fingerprint).
+- Auto sign-in (below) finds these people by the email in the list, so they need no `autologin.users` line.
+
 ## Auto sign-in for power users
 
 Off by default. When it is on, OpsAPI may sign chosen people in with the task link itself, so a task
@@ -109,7 +142,8 @@ opens with one click. All of these must hold:
 - OpsAPI: the terminal has auto sign-in turned on there, the person holds `ai_terminal_autologin`, and
   they confirmed an emailed code (a *step-up*) in the last 12 hours. Only then does OpsAPI add the
   `login` claim, and such a link lives 120 seconds.
-- This gateway: `opsapi.autologin.enabled`, and the person's OpsAPI email is listed under `users`,
+- This gateway: `opsapi.autologin.enabled`, and the person's OpsAPI email is listed under `users` (or they
+  have a key issued in OpsAPI, matched by its email),
   mapped to a terminal user who has an authorized key allowing `local`:
 
   ```yaml

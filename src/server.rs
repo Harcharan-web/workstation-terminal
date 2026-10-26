@@ -768,21 +768,23 @@ fn autologin_key(
             error,
         })
     };
-    let user = crate::opsapi::autologin_user(&cfg.opsapi.autologin, &launch, now).map_err(|e| {
-        let status = match e {
-            AutologinError::Link(_) => StatusCode::BAD_REQUEST,
-            _ => StatusCode::FORBIDDEN,
-        };
-        fail(None, ApiError::new(status, e.code(), e.to_string()))
-    })?;
-    app.auth
-        .check_lockout(ip, Some(user))
-        .map_err(|e| fail(Some(user), e.into()))?;
     let keys = app
         .auth
         .keys
         .current()
-        .map_err(|_| fail(Some(user), AuthError::KeysUnavailable.into()))?;
+        .map_err(|_| fail(None, AuthError::KeysUnavailable.into()))?;
+    let user = crate::opsapi::autologin_user(&cfg.opsapi.autologin, &keys, &launch, now)
+        .map_err(|e| {
+            let status = match e {
+                AutologinError::Link(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::FORBIDDEN,
+            };
+            fail(None, ApiError::new(status, e.code(), e.to_string()))
+        })?;
+    let user = user.as_str();
+    app.auth
+        .check_lockout(ip, Some(user))
+        .map_err(|e| fail(Some(user), e.into()))?;
     let key = keys
         .for_user(user)
         .find(|k| k.access.local)
@@ -1048,6 +1050,10 @@ pub async fn start(cfg: Config, audit: Audit, listener: std::net::TcpListener) -
         }
     });
 
+    if cfg.opsapi.keys.enabled() {
+        tokio::spawn(sync_opsapi_keys(app.clone()));
+    }
+
     app.ready.store(true, Ordering::Relaxed);
     let scheme = if cfg.tls_enabled() { "https" } else { "http" };
     app.audit.log(
@@ -1062,6 +1068,55 @@ pub async fn start(cfg: Config, audit: Audit, listener: std::net::TcpListener) -
         tasks,
         admin_path,
     })
+}
+
+/// Fetch the keys managers issue in OpsAPI (`opsapi.keys`) now and every `interval_secs`. A key
+/// that disappears from the list (blocked, expired, the person left) stops working, and the
+/// housekeeping loop closes its sessions within seconds. Without a good fetch for `max_stale_secs`
+/// all OpsAPI keys stop counting.
+async fn sync_opsapi_keys(app: App) {
+    let k = &app.cfg.opsapi.keys;
+    let mut tick = tokio::time::interval(Duration::from_secs(k.interval_secs));
+    let mut stale_reported = false;
+    loop {
+        tokio::select! {
+            _ = app.shutdown.cancelled() => break,
+            _ = tick.tick() => {}
+        }
+        let now = crate::opsapi::unix_now();
+        let result = crate::opsapi::fetch_keys(&app.cfg, now)
+            .await
+            .and_then(|(generated_at, keys)| app.auth.keys.set_synced(keys, generated_at, now));
+        match result {
+            Ok(change) => {
+                stale_reported = false;
+                for (user, key) in &change.added {
+                    app.audit.log(
+                        AuditEvent::new("opsapi_key_added")
+                            .user(user)
+                            .field("key", key),
+                    );
+                }
+                for (user, key) in &change.removed {
+                    app.audit.log(
+                        AuditEvent::new("opsapi_key_removed")
+                            .user(user)
+                            .field("key", key),
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't fetch keys from OpsAPI");
+                if !stale_reported && app.auth.keys.synced_stale(now) {
+                    tracing::error!(
+                        "no good key list from OpsAPI for too long: its keys stop working until it answers"
+                    );
+                    app.audit.log(AuditEvent::new("opsapi_keys_stale").field("error", &e));
+                    stale_reported = true;
+                }
+            }
+        }
+    }
 }
 
 /// Close sessions whose owning key was revoked, or no longer grants access to the session's

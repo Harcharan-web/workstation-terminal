@@ -117,3 +117,8 @@ logging:
 #     max_stepup_age_secs: 43200   # their emailed OpsAPI code must be at most this old
 #     users:                       # OpsAPI email (any case) -> terminal user with a `local` key
 #       "alice@example.com": alice
+#   keys:                      # keys managers issue people in OpsAPI (Web terminals -> People)
+#     url: https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal/keys
+#     terminal_id: "<this terminal's id in OpsAPI>"
+#     interval_secs: 30          # fetched this often; a blocked key stops at the next fetch
+#     max_stale_secs: 900        # no good fetch for this long: OpsAPI's keys stop (this file's keep working)
