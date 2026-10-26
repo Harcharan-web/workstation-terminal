@@ -111,7 +111,9 @@ async fn a_local_tab_reports_claude_telemetry_and_its_screen_to_opsapi() {
     let endpoint = printed(&ws.output, "EP<").unwrap();
     assert_eq!(token.len(), 64);
 
-    // What Claude Code would post, plus an event it doesn't need and an unattributed post.
+    // What Claude Code would post, plus an event it doesn't need: first without a tab's token
+    // (Claude outside sshweb) and with a wrong one, then with the tab's. The tick that sends the
+    // tab's events has counted the others by then.
     let http = reqwest::Client::new();
     let body = otlp_logs(vec![
         record("hook_registered", json!({})),
@@ -131,7 +133,8 @@ async fn a_local_tab_reports_claude_telemetry_and_its_screen_to_opsapi() {
             }),
         ),
     ]);
-    for auth in [Some(token.as_str()), None] {
+    let wrong = "0".repeat(64);
+    for auth in [None, Some(wrong.as_str()), Some(token.as_str())] {
         let mut req = http.post(&endpoint).json(&body);
         if let Some(t) = auth {
             req = req.bearer_auth(t);
@@ -144,9 +147,10 @@ async fn a_local_tab_reports_claude_telemetry_and_its_screen_to_opsapi() {
     // Within a tick OpsAPI gets the tab and the events, signed.
     let mut events: Vec<Value> = Vec::new();
     let mut tab = Value::Null;
-    while events.len() < 4 || tab.is_null() {
+    while events.len() < 2 || tab.is_null() {
         let h = next_hit(&mut hits).await;
         assert_eq!(h.path, "/terminal/activity", "only activity before the tab closes");
+        assert!(!String::from_utf8_lossy(&h.body).contains("\"tab\":null"));
         assert_eq!(h.header("x-opsapi-terminal"), TERMINAL);
         assert_eq!(
             h.header("x-opsapi-signature"),
@@ -166,7 +170,7 @@ async fn a_local_tab_reports_claude_telemetry_and_its_screen_to_opsapi() {
     assert_eq!(tab["via"], "key");
     assert!(tab["key"].as_str().unwrap().starts_with("SHA256:"));
     assert!(tab["launch"].is_null() && tab["closed_at"].is_null());
-    assert_eq!(events.len(), 4, "{events:?}");
+    assert_eq!(events.len(), 2, "only the tab's own posts: {events:?}");
     let mine: Vec<&Value> = events
         .iter()
         .filter(|e| e["tab"] == sid.as_str())
@@ -185,14 +189,20 @@ async fn a_local_tab_reports_claude_telemetry_and_its_screen_to_opsapi() {
     let req = mine.iter().find(|e| e["type"] == "api_request").unwrap();
     assert_eq!(req["attrs"]["model"], "claude-opus-5-5");
     assert_eq!(req["attrs"]["input_tokens"], 2);
-    let stray: Vec<&Value> = events.iter().filter(|e| e["tab"].is_null()).collect();
-    assert_eq!(
-        stray.len(),
-        2,
-        "posts without a known token are kept unattributed"
-    );
-    assert!(stray[0]["id"].as_str().unwrap().starts_with("none:"));
     assert!(!json!(events).to_string().contains("priya@"));
+    // The two posts without a tab's token were only counted.
+    let audit = env.audit_log();
+    let dropped: Vec<Value> = audit
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| v["event"] == "work_log_unattributed_dropped")
+        .collect();
+    assert_eq!(dropped.len(), 1, "{audit}");
+    assert_eq!(dropped[0]["count"], 2);
+    assert!(
+        !audit.contains("fix the header"),
+        "no content in the audit log"
+    );
 
     // Closing the tab uploads the screen recording's last part.
     ws.input("echo RECORDED_$((6*7))\r").await;

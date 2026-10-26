@@ -5,7 +5,8 @@
 //! - **Claude Code telemetry.** Each local tab's shell gets a random token and Claude's
 //!   OpenTelemetry settings pointing at a loopback-only receiver ([`otlp`]); the token names the
 //!   tab. Prompts, model requests, tool results and decisions, API errors and four metrics are
-//!   kept; everything else is dropped.
+//!   kept; everything else is dropped, and so is anything without a tab's token (Claude outside
+//!   sshweb tabs), which is only counted.
 //! - **Screen.** Each local tab's output (never its input) is recorded as asciicast v2 parts
 //!   ([`recorder`]), kept gzipped in `<state_dir>/recordings` (0600) until uploaded.
 //!
@@ -24,6 +25,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tracing::warn;
 
+use crate::audit::{Audit, AuditEvent};
 use crate::auth::sessions::{Login, unix_now};
 use crate::config::Config;
 use crate::session::Target;
@@ -38,6 +40,8 @@ const ACTIVE_WINDOW_SECS: u64 = 60;
 /// An open tab whose state changed is re-sent at most this often.
 const RESEND_AFTER: Duration = Duration::from_secs(60);
 pub const TICK: Duration = Duration::from_secs(10);
+/// Dropped unattributed posts are audited at most this often.
+const UNATTRIBUTED_AUDIT_EVERY: Duration = Duration::from_secs(60);
 
 pub struct WorkLog {
     url: String,
@@ -50,6 +54,9 @@ pub struct WorkLog {
     tokens: Mutex<HashMap<[u8; 32], String>>,
     events: Mutex<EventQueue>,
     pub uploads: Arc<recorder::Uploads>,
+    /// Telemetry posts without a tab's token, not yet audited, and when they last were.
+    unattributed: Mutex<(u64, Option<Instant>)>,
+    audit: Arc<Audit>,
 }
 
 struct EventQueue {
@@ -196,7 +203,7 @@ pub struct Batch {
 
 impl WorkLog {
     /// None unless `opsapi.work_log.enabled`. `otlp_port` must be the port actually bound.
-    pub fn new(cfg: &Config) -> Option<Arc<Self>> {
+    pub fn new(cfg: &Config, audit: Arc<Audit>) -> Option<Arc<Self>> {
         let w = &cfg.opsapi.work_log;
         if !w.enabled {
             return None;
@@ -207,6 +214,8 @@ impl WorkLog {
             .unwrap_or(0);
         let uploads = Arc::new(recorder::Uploads::new(
             cfg.server.state_dir.join("recordings"),
+            w.max_pending_mb.saturating_mul(1024 * 1024),
+            audit.clone(),
         ));
         uploads.load_leftovers();
         Some(Arc::new(Self {
@@ -223,14 +232,16 @@ impl WorkLog {
             record: w.record,
             tabs: Mutex::new(HashMap::new()),
             tokens: Mutex::new(HashMap::new()),
-            // Starting from the clock keeps `<tab>:<seq>` ids (and `none:<seq>`) unique across
-            // restarts, as long as fewer than a million events a second arrive.
+            // Starting from the clock keeps `<tab>:<seq>` ids unique across restarts (tab ids
+            // already are; this is belt and braces), as long as < 1M events a second arrive.
             events: Mutex::new(EventQueue {
                 items: VecDeque::new(),
                 next_seq: micros,
                 dropped: 0,
             }),
             uploads,
+            unattributed: Mutex::new((0, None)),
+            audit,
         }))
     }
 
@@ -319,14 +330,19 @@ impl WorkLog {
         self.tokens.lock().unwrap().get(&h).cloned()
     }
 
-    /// Queue telemetry events for the tab (None: no known token, kept as unattributed).
-    pub fn push_events(&self, tab: Option<&str>, drafts: Vec<otlp::Draft>) {
+    /// A telemetry post without a tab's token: discarded unread, only counted.
+    pub fn drop_unattributed(&self) {
+        self.unattributed.lock().unwrap().0 += 1;
+    }
+
+    /// Queue telemetry events for the tab.
+    pub fn push_events(&self, tab: &str, drafts: Vec<otlp::Draft>) {
         let mut q = self.events.lock().unwrap();
         for d in drafts {
             let seq = q.next_seq;
             q.next_seq += 1;
             let mut e = json!({
-                "id": format!("{}:{seq}", tab.unwrap_or("none")),
+                "id": format!("{tab}:{seq}"),
                 "tab": tab,
                 "at": d.at,
                 "type": d.kind,
@@ -354,8 +370,16 @@ impl WorkLog {
         }
     }
 
-    /// Every 10 s: count active time and close recording parts older than 60 s.
+    /// Every 10 s: count active time, close recording parts older than 60 s, and audit dropped
+    /// unattributed posts (at most once a minute).
     pub fn tick(&self) {
+        let mut u = self.unattributed.lock().unwrap();
+        if u.0 > 0 && u.1.is_none_or(|t| t.elapsed() >= UNATTRIBUTED_AUDIT_EVERY) {
+            let ev = AuditEvent::new("work_log_unattributed_dropped");
+            self.audit.log(ev.num("count", u.0 as i64));
+            *u = (0, Some(Instant::now()));
+        }
+        drop(u);
         let tabs: Vec<_> = self.tabs.lock().unwrap().values().cloned().collect();
         for t in tabs.iter().filter(|t| !t.is_closed()) {
             let last = t.last_active.load(Ordering::Relaxed);
@@ -446,13 +470,17 @@ mod tests {
     use crate::auth::keys::Access;
 
     fn work_log(dir: &std::path::Path) -> Arc<WorkLog> {
+        work_log_with(dir, Audit::disabled())
+    }
+
+    fn work_log_with(dir: &std::path::Path, audit: Audit) -> Arc<WorkLog> {
         let mut cfg = Config::default();
         cfg.server.state_dir = dir.to_path_buf();
         cfg.opsapi.work_log.enabled = true;
         cfg.opsapi.work_log.url = Some("https://ops.example/terminal/".into());
         cfg.opsapi.webhook_secret = Some(crate::opsapi::tests::SECRET.into());
         cfg.opsapi.keys.terminal_id = Some("6F1C2A9E-1111-4C4C-9D9D-0123456789AB".into());
-        WorkLog::new(&cfg).unwrap()
+        WorkLog::new(&cfg, Arc::new(audit)).unwrap()
     }
 
     fn login() -> Login {
@@ -533,8 +561,8 @@ mod tests {
         w.register(&tab);
         tab.input(3);
         let two = vec![draft("user_prompt"), draft("api_request")];
-        w.push_events(Some("t1"), two);
-        w.push_events(None, vec![draft("api_error")]);
+        w.push_events("t1", two);
+        w.push_events("t1", vec![draft("api_error")]);
 
         let b = w.batch(1792828054).unwrap();
         let v: Value = serde_json::from_str(&b.body).unwrap();
@@ -551,8 +579,7 @@ mod tests {
         assert!(ev[0]["id"].as_str().unwrap().starts_with("t1:"));
         assert_eq!(ev[0]["session"], "s1");
         assert!(ev[0].get("prompt_id").is_none());
-        assert!(ev[2]["tab"].is_null());
-        assert!(ev[2]["id"].as_str().unwrap().starts_with("none:"));
+        assert_eq!(ev[2]["tab"], "t1");
         let seq = |e: &Value| -> u64 {
             let id = e["id"].as_str().unwrap();
             id[id.find(':').unwrap() + 1..].parse().unwrap()
@@ -579,11 +606,40 @@ mod tests {
     }
 
     #[test]
+    fn unattributed_posts_are_only_counted_and_audited_once_a_minute() {
+        use crate::config::{AuditConfig, AuditDestination};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let audit = Audit::open(&AuditConfig {
+            destination: AuditDestination::File,
+            path: path.clone(),
+        })
+        .unwrap();
+        let w = work_log_with(dir.path(), audit);
+        w.tick();
+        for _ in 0..3 {
+            w.drop_unattributed();
+        }
+        w.tick();
+        w.drop_unattributed();
+        w.tick();
+        assert!(w.batch(1).is_none(), "nothing is forwarded");
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(log.matches("work_log_unattributed_dropped").count(), 1);
+        assert!(log.contains("\"count\":3"), "{log}");
+        assert_eq!(
+            w.unattributed.lock().unwrap().0,
+            1,
+            "waits for the next minute"
+        );
+    }
+
+    #[test]
     fn the_queue_is_bounded_and_batches_are_capped() {
         let dir = tempfile::tempdir().unwrap();
         let w = work_log(dir.path());
         let n = MAX_QUEUED_EVENTS + 5;
-        w.push_events(None, (0..n).map(|_| draft("api_request")).collect());
+        w.push_events("t1", (0..n).map(|_| draft("api_request")).collect());
         assert_eq!(w.events.lock().unwrap().items.len(), MAX_QUEUED_EVENTS);
         let b = w.batch(1).unwrap();
         let v: Value = serde_json::from_str(&b.body).unwrap();

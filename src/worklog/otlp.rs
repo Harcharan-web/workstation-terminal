@@ -1,9 +1,10 @@
 //! Loopback-only OTLP/HTTP (JSON) receiver for Claude Code's telemetry.
 //!
 //! `POST /v1/logs` and `POST /v1/metrics` on `127.0.0.1:<otlp_port>`. The bearer token names the
-//! tab; posts without a known token are kept as unattributed (`tab: null`), so tampering shows.
-//! Only the log events and metrics OpsAPI uses are kept; personal attributes are dropped and long
-//! text is cut.
+//! tab. Claude's managed settings reach every Claude Code on the Mac, so a post without a live
+//! tab's token (the owner's own Claude, say) is answered `200 {}` and discarded unread; only their
+//! number is audited. Only the log events and metrics OpsAPI uses are kept; personal attributes
+//! are dropped and long text is cut.
 
 use std::sync::Arc;
 
@@ -239,13 +240,18 @@ fn receive(
     if !get(header::CONTENT_TYPE).starts_with("application/json") {
         return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "send http/json").into_response();
     }
-    let Ok(v) = serde_json::from_slice::<Value>(body) else {
-        return (StatusCode::BAD_REQUEST, "bad JSON").into_response();
-    };
     let tab = get(header::AUTHORIZATION)
         .strip_prefix("Bearer ")
         .and_then(|t| wl.tab_for_token(t.trim()));
-    wl.push_events(tab.as_deref(), parse(&v));
+    let Some(tab) = tab else {
+        // Answered like any other, so Claude neither retries nor complains.
+        wl.drop_unattributed();
+        return axum::Json(json!({})).into_response();
+    };
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return (StatusCode::BAD_REQUEST, "bad JSON").into_response();
+    };
+    wl.push_events(&tab, parse(&v));
     axum::Json(json!({})).into_response()
 }
 

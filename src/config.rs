@@ -61,6 +61,8 @@ pub struct WorkLogConfig {
     pub otlp_port: u16,
     /// Record each local tab's output (never its input).
     pub record: bool,
+    /// New recording parts are skipped (a gap) while this much waits for upload.
+    pub max_pending_mb: u64,
 }
 
 impl Default for WorkLogConfig {
@@ -70,6 +72,7 @@ impl Default for WorkLogConfig {
             url: None,
             otlp_port: 7683,
             record: true,
+            max_pending_mb: 2048,
         }
     }
 }
@@ -803,6 +806,9 @@ impl Config {
             if o.webhook_secret.as_deref().unwrap_or("").is_empty() {
                 errs.push("opsapi.work_log needs opsapi.webhook_secret".into());
             }
+            if w.max_pending_mb == 0 {
+                errs.push("opsapi.work_log.max_pending_mb must be positive".into());
+            }
         }
         let al = &o.autologin;
         if al.enabled && o.webhook_secret.as_deref().unwrap_or("").is_empty() {
@@ -1070,6 +1076,7 @@ mod tests {
         assert!(!c.opsapi.work_log.enabled);
         assert_eq!(c.opsapi.work_log.otlp_port, 7683);
         assert!(c.opsapi.work_log.record);
+        assert_eq!(c.opsapi.work_log.max_pending_mb, 2048);
         let c = Config::from_yaml(
             "opsapi:\n  webhook_secret: \"0123456789abcdef0123456789abcdef\"\n  keys:\n    \
              terminal_id: 6f1c2a9e-1111-4c4c-9d9d-0123456789ab\n  work_log:\n    \
@@ -1078,11 +1085,17 @@ mod tests {
         .unwrap();
         assert!(c.validate_static().is_empty(), "{:?}", c.validate_static());
         let bad = Config::from_yaml(
-            "opsapi:\n  work_log:\n    enabled: true\n    url: http://ops.example/terminal\n",
+            "opsapi:\n  work_log:\n    enabled: true\n    url: http://ops.example/terminal\n    \
+             max_pending_mb: 0\n",
         )
         .unwrap();
         let errs = bad.validate_static().join("\n");
-        for want in ["work_log.url must be https", "terminal_id", "webhook_secret"] {
+        for want in [
+            "work_log.url must be https",
+            "terminal_id",
+            "webhook_secret",
+            "max_pending_mb",
+        ] {
             assert!(errs.contains(want), "{want}: {errs}");
         }
         assert!(Config::from_yaml("opsapi:\n  work_log:\n    recrd: true\n").is_err());

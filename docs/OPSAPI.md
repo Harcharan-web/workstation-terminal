@@ -227,6 +227,7 @@ opsapi:
     url: https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal
     otlp_port: 7683      # loopback-only receiver for Claude's telemetry
     record: true         # screen recordings of local tabs
+    max_pending_mb: 2048 # recordings waiting for upload; over this, new parts are skipped
 ```
 
 How it works:
@@ -237,9 +238,11 @@ How it works:
   `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <token>`, `OTEL_LOG_USER_PROMPTS=1`,
   `OTEL_LOG_TOOL_DETAILS=1`, `OTEL_LOGS_EXPORT_INTERVAL=5000`, `OTEL_METRIC_EXPORT_INTERVAL=30000`.
 - The receiver listens on `127.0.0.1:<otlp_port>` only (plain HTTP, `POST /v1/logs` and
-  `/v1/metrics`, JSON only, 4 MiB per post, loopback `Host` only). The token names the tab; a post
-  without a known token is kept with `tab: null`, so tampering shows. A token stops working when its tab
-  ends. Only the `user_prompt`, `api_request`, `api_error`, `tool_result` and `tool_decision` events and
+  `/v1/metrics`, JSON only, 4 MiB per post, loopback `Host` only). The token names the tab. A post
+  without a live tab's token (Claude outside an sshweb tab, a forged or old token) is answered
+  `200 {}` and discarded unread: nothing of it reaches OpsAPI, only how many there were is audited
+  (`work_log_unattributed_dropped` with `count`, at most once a minute). A token stops working when its
+  tab ends. Only the `user_prompt`, `api_request`, `api_error`, `tool_result` and `tool_decision` events and
   the `claude_code.{lines_of_code,commit,pull_request}.count` and `claude_code.active_time.total`
   metrics are kept.
 - Every 10 s, when something is new, the gateway sends `POST {url}/activity` (`X-Opsapi-Terminal`,
@@ -251,8 +254,12 @@ How it works:
   `<state_dir>/recordings/<tab>-<part>.cast.gz` (0600), sent as `POST {url}/recordings`
   (`X-Opsapi-Tab`, `X-Opsapi-Part`, `X-Opsapi-Final`, signature over `"<tab>\n<part>\n"` + body) and
   deleted once OpsAPI has it. Parts left by an earlier run are sent at start. Recording goes on while no
-  browser is attached.
-- Audit events: `work_log_send_failed` (once per outage), `work_log_events_dropped` (with a count).
+  browser is attached. While `max_pending_mb` of parts wait for upload, new parts are skipped (a gap in
+  the tab's part numbers; a tab's last part is still sent, without its events, so the recording ends)
+  until uploads make room.
+- Audit events: `work_log_send_failed` (once per outage), `work_log_events_dropped` (with a count),
+  `work_log_unattributed_dropped` (with a count), `work_log_recording_skipped` (with the tab, once per
+  outage).
 
 ### Claude's managed settings
 
@@ -268,9 +275,10 @@ sudo install -o root -g wheel -m 755 packaging/sshweb-otel-headers /usr/local/li
 ```
 
 If `otlp_port` isn't 7683, change the two endpoints in the file. The settings apply to **every** Claude
-Code on this Mac: outside an sshweb tab the helper sends no token, so (while a gateway listens) that
-Claude's telemetry reaches OpsAPI as unattributed. Install them only on a Mac whose Claude users have all
-been told.
+Code on this Mac. Outside an sshweb tab the helper sends no token, so that Claude's telemetry goes to
+the loopback receiver and is discarded (or nowhere, when no gateway runs): other people's and the
+owner's own prompts never reach OpsAPI. Still tell everyone who uses Claude on this Mac that its
+telemetry is switched on machine-wide.
 
 ## A separate macOS account for task terminals
 

@@ -127,3 +127,4 @@ logging:
 #     url: https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal
 #     otlp_port: 7683            # loopback-only receiver for Claude's telemetry (127.0.0.1)
 #     record: true               # record each local tab's output (never its input)
+#     max_pending_mb: 2048       # recordings waiting for upload; over this, new parts are skipped

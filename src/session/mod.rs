@@ -298,7 +298,7 @@ pub struct SessionManager {
 impl SessionManager {
     pub fn new(cfg: Arc<Config>, audit: Arc<Audit>, metrics: Arc<Metrics>) -> Arc<Self> {
         Arc::new(Self {
-            work_log: crate::worklog::WorkLog::new(&cfg),
+            work_log: crate::worklog::WorkLog::new(&cfg, audit.clone()),
             cfg,
             sessions: Mutex::new(HashMap::new()),
             audit,

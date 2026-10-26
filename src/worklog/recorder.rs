@@ -3,16 +3,20 @@
 //! Part 0 starts with the header `{"version":2,"width":..,"height":..,"timestamp":..}`; then one
 //! line per event, `[secs since the tab started, "o", text]` or `[secs, "r", "COLSxROWS"]`. A
 //! part closes after 60 s or 1 MiB (uncompressed), and at tab close (the last part). It is
-//! gzipped to `<state_dir>/recordings/<tab>-<part>.cast.gz` (0600) and queued for upload.
+//! gzipped to `<state_dir>/recordings/<tab>-<part>.cast.gz` (0600) and queued for upload. While
+//! `max_pending_mb` waits for upload, new parts are skipped: the tab's part numbers show the gap.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tracing::warn;
+
+use crate::audit::{Audit, AuditEvent};
 
 pub const MAX_PART_BYTES: usize = 1024 * 1024;
 pub const MAX_PART_AGE: Duration = Duration::from_secs(60);
@@ -25,6 +29,8 @@ pub struct Part {
     pub part: u64,
     /// The tab's last part (`X-Opsapi-Final: 1`).
     pub last: bool,
+    /// Size on disk.
+    pub bytes: u64,
 }
 
 /// Parts waiting for upload, oldest first.
@@ -32,18 +38,29 @@ pub struct Uploads {
     pub dir: PathBuf,
     queue: Mutex<VecDeque<Part>>,
     pub ready: tokio::sync::Notify,
+    /// Bytes of the queued parts, and the most that may wait.
+    pending: AtomicU64,
+    cap: u64,
+    /// A part was skipped since the last one written (audited once per outage).
+    over_cap: AtomicBool,
+    audit: Arc<Audit>,
 }
 
 impl Uploads {
-    pub fn new(dir: PathBuf) -> Self {
+    pub fn new(dir: PathBuf, cap: u64, audit: Arc<Audit>) -> Self {
         Self {
             dir,
             queue: Mutex::new(VecDeque::new()),
             ready: tokio::sync::Notify::new(),
+            pending: AtomicU64::new(0),
+            cap,
+            over_cap: AtomicBool::new(false),
+            audit,
         }
     }
 
     pub fn push(&self, p: Part) {
+        self.pending.fetch_add(p.bytes, Ordering::Relaxed);
         self.queue.lock().unwrap().push_back(p);
         self.ready.notify_one();
     }
@@ -53,7 +70,23 @@ impl Uploads {
     }
 
     pub fn pop_front(&self) {
-        self.queue.lock().unwrap().pop_front();
+        if let Some(p) = self.queue.lock().unwrap().pop_front() {
+            self.pending.fetch_sub(p.bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Is there room for another part of `tab`? The first refusal of an outage is audited.
+    fn room(&self, tab: &str) -> bool {
+        if self.pending.load(Ordering::Relaxed) < self.cap {
+            self.over_cap.store(false, Ordering::Relaxed);
+            return true;
+        }
+        if !self.over_cap.swap(true, Ordering::Relaxed) {
+            warn!(tab, "recordings waiting for upload reached max_pending_mb; skipping parts");
+            let ev = AuditEvent::new("work_log_recording_skipped");
+            self.audit.log(ev.field("tab", tab));
+        }
+        false
     }
 
     /// Queue parts left by an earlier run. Every tab in them has ended (sessions don't outlive
@@ -62,7 +95,7 @@ impl Uploads {
         let Ok(rd) = std::fs::read_dir(&self.dir) else {
             return;
         };
-        let mut found: BTreeMap<(String, u64), PathBuf> = BTreeMap::new();
+        let mut found: BTreeMap<(String, u64), (PathBuf, u64)> = BTreeMap::new();
         for e in rd.flatten() {
             let path = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
@@ -70,17 +103,19 @@ impl Uploads {
                 // A part being written when the gateway stopped: incomplete.
                 let _ = std::fs::remove_file(&path);
             } else if let Some((tab, part)) = parse_name(&name) {
-                found.insert((tab, part), path);
+                let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+                found.insert((tab, part), (path, bytes));
             }
         }
         let parts: Vec<_> = found.into_iter().collect();
-        for (i, ((tab, part), path)) in parts.iter().enumerate() {
+        for (i, ((tab, part), (path, bytes))) in parts.iter().enumerate() {
             let last = parts.get(i + 1).is_none_or(|((next, _), _)| next != tab);
             self.push(Part {
                 path: path.clone(),
                 tab: tab.clone(),
                 part: *part,
                 last,
+                bytes: *bytes,
             });
         }
     }
@@ -198,21 +233,31 @@ impl Recorder {
     }
 
     fn close_part(&mut self, last: bool) {
-        let data = std::mem::take(&mut self.buf);
-        let path = self
-            .uploads
-            .dir
-            .join(format!("{}-{}.cast.gz", self.tab, self.part));
-        // ponytail: gzip and write run on the PTY pump's task (a few ms per MiB); move to
-        // spawn_blocking if output-heavy tabs ever stall.
-        match write_part(&path, &data) {
-            Ok(()) => self.uploads.push(Part {
-                path,
-                tab: self.tab.clone(),
-                part: self.part,
-                last,
-            }),
-            Err(e) => warn!(error = %e, tab = %self.tab, "couldn't save a recording part; lost"),
+        let mut data = std::mem::take(&mut self.buf);
+        let room = self.uploads.room(&self.tab);
+        if !room {
+            // Too much waits for upload: drop the events. The last part still goes out (part 0
+            // with its header), so OpsAPI knows the recording ended.
+            let header = data.iter().position(|b| *b == b'\n').map_or(0, |i| i + 1);
+            data.truncate(if self.part == 0 { header } else { 0 });
+        }
+        if room || last {
+            let path = self
+                .uploads
+                .dir
+                .join(format!("{}-{}.cast.gz", self.tab, self.part));
+            // ponytail: gzip and write run on the PTY pump's task (a few ms per MiB); move to
+            // spawn_blocking if output-heavy tabs ever stall.
+            match write_part(&path, &data) {
+                Ok(bytes) => self.uploads.push(Part {
+                    path,
+                    tab: self.tab.clone(),
+                    part: self.part,
+                    last,
+                    bytes,
+                }),
+                Err(e) => warn!(error = %e, tab = %self.tab, "couldn't save a recording part"),
+            }
         }
         self.part += 1;
         self.part_started = Instant::now();
@@ -221,7 +266,8 @@ impl Recorder {
 }
 
 /// Gzip `data` to `path` (0600), via a temporary file so a crash never leaves half a part.
-fn write_part(path: &Path, data: &[u8]) -> std::io::Result<()> {
+/// Returns the size written.
+fn write_part(path: &Path, data: &[u8]) -> std::io::Result<u64> {
     let dir = path.parent().unwrap_or(Path::new("."));
     crate::security::perms::ensure_private_dir(dir)?;
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -229,7 +275,8 @@ fn write_part(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let gz = gz.finish()?;
     let tmp = path.with_extension("gz.tmp");
     crate::security::perms::write_new_file(&tmp, &gz, 0o600, true)?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    Ok(gz.len() as u64)
 }
 
 #[cfg(test)]
@@ -259,11 +306,19 @@ mod tests {
         s.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
     }
 
+    fn uploads(dir: &Path, cap: u64) -> Arc<Uploads> {
+        Arc::new(Uploads::new(
+            dir.to_path_buf(),
+            cap,
+            Arc::new(Audit::disabled()),
+        ))
+    }
+
     #[test]
     fn parts_rotate_by_size_and_age_with_the_header_only_in_part_0() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let u = Arc::new(Uploads::new(dir.path().join("recordings")));
+        let u = uploads(&dir.path().join("recordings"), u64::MAX);
         let tab = "ab12";
         let mut r = Recorder::new(u.clone(), tab, 80, 24, 1792828000);
         // Over 1 MiB of output closes part 0 by itself.
@@ -314,7 +369,7 @@ mod tests {
     #[test]
     fn characters_split_across_reads_stay_whole() {
         let dir = tempfile::tempdir().unwrap();
-        let u = Arc::new(Uploads::new(dir.path().to_path_buf()));
+        let u = uploads(dir.path(), u64::MAX);
         let mut r = Recorder::new(u.clone(), "cd34", 80, 24, 0);
         let s = "a€b😀".as_bytes();
         r.output(&s[..2]); // "a" + first byte of €
@@ -342,7 +397,7 @@ mod tests {
         ] {
             std::fs::write(dir.path().join(f), b"").unwrap();
         }
-        let u = Uploads::new(dir.path().to_path_buf());
+        let u = uploads(dir.path(), u64::MAX);
         u.load_leftovers();
         let got: Vec<_> = drain(&u)
             .into_iter()
@@ -357,5 +412,55 @@ mod tests {
             ]
         );
         assert!(!dir.path().join("bb-2.cast.gz.tmp").exists());
+    }
+
+    #[test]
+    fn parts_are_skipped_while_too_much_waits_for_upload() {
+        use crate::config::{AuditConfig, AuditDestination};
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit.log");
+        let audit = Audit::open(&AuditConfig {
+            destination: AuditDestination::File,
+            path: audit_path.clone(),
+        })
+        .unwrap();
+        let u = Arc::new(Uploads::new(
+            dir.path().join("recordings"),
+            1,
+            Arc::new(audit),
+        ));
+        let mut r = Recorder::new(u.clone(), "ef56", 80, 24, 0);
+        let mut part = |text: &str| {
+            r.output(text.as_bytes());
+            r.rotate_if_older(Duration::ZERO);
+        };
+        part("a"); // written: nothing waits yet
+        part("b"); // skipped, audited
+        part("c"); // skipped
+        u.pop_front(); // uploaded: room again
+        part("d");
+        r.output(b"e");
+        r.finish(); // over the cap again: the last part goes out without its events
+        let parts = drain(&u);
+        assert_eq!(
+            parts.iter().map(|p| (p.part, p.last)).collect::<Vec<_>>(),
+            [(3, false), (4, true)]
+        );
+        assert_eq!(lines(&gunzip(&parts[0].path))[0][2], "d");
+        assert_eq!(gunzip(&parts[1].path), "");
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        assert_eq!(log.matches("work_log_recording_skipped").count(), 2, "{log}");
+        assert!(log.contains("\"tab\":\"ef56\""));
+
+        // A tab whose only part is skipped still sends part 0 with its header.
+        let u = uploads(&dir.path().join("recordings"), 0);
+        let mut r = Recorder::new(u.clone(), "ab78", 100, 30, 7);
+        r.output(b"lost");
+        r.finish();
+        let p = drain(&u);
+        assert_eq!(p.len(), 1);
+        let l = lines(&gunzip(&p[0].path));
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0]["width"], 100);
     }
 }
