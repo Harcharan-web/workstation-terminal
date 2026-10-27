@@ -282,32 +282,75 @@ telemetry is switched on machine-wide.
 
 ## A separate macOS account for task terminals
 
-Every terminal runs as the macOS account that runs `sshweb`, with that account's files, keys and tokens.
-Run the gateway that employees use under **its own account**, not an owner's, so a task terminal can't
-read the owner's credentials. On the Mac, as an administrator:
+Every terminal runs as one macOS account. If that is the account `sshweb` itself runs as, anything typed
+in a terminal (or run by an agent there) can read the gateway's config with its OpsAPI secret, its TLS key
+and its audit log and pending work log, and so could fake task reports or edit the record. So the gateway
+that employees use runs with **two accounts**:
+
+- **`_sshweb`**, a hidden service account with no shell and no login: runs the gateway and alone can read
+  its config (`root:_sshweb 640`), secret, TLS key and state (`_sshweb 700`: audit log, work-log queue,
+  recordings, admin socket).
+- **`workstation`**, a standard (non-admin) account: the terminals' shells run as it (`local.run_as:
+  workstation`), with its own files, agent logins and GitHub access. It has no sudo and can't read the
+  gateway's files.
+
+Neither is an owner's account, so a task terminal can't read the owner's credentials either.
+
+### Shells as another account
+
+With `local.run_as`, sshweb starts each local shell with `sudo -n -H -u <account> -- <shell> …` and sends
+signals with `sudo -n -u <account> -- /bin/kill …`. It needs the rule in
+[packaging/sshweb.sudoers](../packaging/sshweb.sudoers) (account names adjusted). The rule:
+
+- lets `_sshweb` act as `workstation` and nothing else: not as root, not as any other account. A shell
+  can run anything, so listing only shells would not narrow it;
+- makes sudo hand over to the shell without staying around as root (`!pam_session, !pam_setcred,
+  !use_pty`), so the gateway can still stop it, and sets HOME to the account's (`always_set_home`);
+- keeps only the terminal's variables (`env_keep`: `TERM`, locale, `OPSAPI_*`, `SSHWEB_*`, `OTEL_*`,
+  `CLAUDE_CODE_*`). Task text and tokens never go on a command line.
+
+`sshweb config validate` (run at every start too) checks all of it by running a test shell through sudo,
+and names what's missing. The gateway still checks and enters tab folders itself, so give `_sshweb`
+search access to the account's home: `chmod +a "user:_sshweb allow search" /Users/workstation`.
+
+On the Mac, as an administrator (the OpsAPI setup kit does the same, with checks):
 
 ```sh
-# 1. The account (standard, not admin). Pick a strong password; it is only for administration.
-sudo sysadminctl -addUser workstation -fullName "Workstation agents" -password -
-sudo mkdir -p /Users/workstation/projects /Users/workstation/.local/bin
-sudo chown -R workstation:staff /Users/workstation/projects /Users/workstation/.local
+# 1. The shells' account: standard, not admin; nobody needs its password.
+sudo sysadminctl -addUser workstation -fullName "Workstation agents" -password "$(openssl rand -base64 30)"
+sudo mkdir -p /Users/workstation/projects && sudo chown workstation:staff /Users/workstation/projects
 
-# 2. The gateway binary (built from this repository) and its config, as that user.
-sudo install -o workstation -m 0755 target/release/sshweb /Users/workstation/.local/bin/sshweb
-sudo -iu workstation /Users/workstation/.local/bin/sshweb config init
-sudo -iu workstation nano /Users/workstation/.sshweb/config.yaml   # see below
-sudo -iu workstation /Users/workstation/.local/bin/sshweb config validate
+# 2. The gateway's account: hidden, no shell, no home, no password. Pick a free id below 500.
+id=$(( $(dscl . -list /Users UniqueID | awk '$2<500 {print $2}' | sort -n | tail -1) + 1 ))
+sudo dscl . -create /Groups/_sshweb PrimaryGroupID $id
+sudo dscl . -create /Users/_sshweb UniqueID $id
+sudo dscl . -create /Users/_sshweb PrimaryGroupID $id
+sudo dscl . -create /Users/_sshweb UserShell /usr/bin/false
+sudo dscl . -create /Users/_sshweb NFSHomeDirectory /var/empty
+sudo dscl . -create /Users/_sshweb IsHidden 1
+sudo chmod +a "user:_sshweb allow search" /Users/workstation
 
-# 3. Start it at boot without anyone logging in (a daemon that runs as that user).
+# 3. The sudo rule, checked before it goes in.
+sudo visudo -cf packaging/sshweb.sudoers && sudo install -o root -g wheel -m 440 packaging/sshweb.sudoers /etc/sudoers.d/sshweb
+
+# 4. Binary, config and state.
+sudo install -o root -g wheel -m 755 target/release/sshweb /usr/local/bin/sshweb
+sudo install -d -o root -g wheel -m 755 /usr/local/etc/sshweb
+sudo install -d -o _sshweb -g _sshweb -m 700 /usr/local/var/sshweb /usr/local/var/sshweb/run
+# config.yaml: root:_sshweb 640, with local.run_as: workstation, state_dir/audit under /usr/local/var/sshweb
+sudo -u _sshweb /usr/local/bin/sshweb config validate --config /usr/local/etc/sshweb/config.yaml
+
+# 5. Start it at boot without anyone logging in.
 sudo cp packaging/com.sshweb.agents.plist /Library/LaunchDaemons/
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.sshweb.agents.plist
 ```
 
 Config for this instance: a different port from any other gateway (e.g. `7682`), the same
 `server.trusted_proxies` and TLS approach as the existing one, `allowed_origins` = its public address,
-`local.allowed_roots: [~/projects]`, and the `opsapi:` block from OpsAPI.
+`local.allowed_roots: [/Users/workstation/projects]`, `local.run_as: workstation`, and the `opsapi:` block
+from OpsAPI. Use absolute paths: `~` means the gateway's home (`/var/empty`).
 
-Then, as that user (`sudo -iu workstation`):
+Then, as the shells' account (`sudo -iu workstation`):
 
 - sign the agents in with accounts meant for this machine. Nobody logs in to this account's desktop,
   so its login keychain stays locked: tools that keep tokens in the keychain fail there. Use token files
@@ -316,11 +359,17 @@ Then, as that user (`sudo -iu workstation`):
   `cursor-agent login` where they offer file storage;
 - give it its own GitHub access (`gh auth login --insecure-storage` with a machine account or a
   fine-grained token limited to the repositories it works on), and `git config --global user.name/user.email`;
-- clone the projects into `~/projects`;
-- add each person's public key: `sshweb keys add --user <name> --access local <their key>.pub`.
+- clone the projects into `~/projects`.
+
+People's keys come from OpsAPI (`opsapi.keys`) or `sudo sshweb keys add --config … --user <name> --access
+local <key>.pub`. Admin commands talk to the running gateway as its account:
+`sudo -u _sshweb sshweb sessions list --config /usr/local/etc/sshweb/config.yaml`.
 
 Finally route a public name to it (reverse proxy → `https://<mac>:7682`, see "Behind a reverse proxy"
 in the README) and enter that address in OpsAPI.
 
-People sharing this account can still see each other's work in it: separation between them is by
-policy only. Separation from the owner's account is real.
+What this separates and what it doesn't: the gateway, its secret and its records from everything run in a
+terminal (real), and the terminals from the owner's account (real). People sharing `workstation` can
+still see and change each other's work in it, including each other's tab tokens: separation between
+them is by policy only. Their shells' terminal device belongs to `_sshweb`, so the rare program that
+reopens its terminal by name (rather than `/dev/tty`) can't; ssh, git, editors and agents don't.

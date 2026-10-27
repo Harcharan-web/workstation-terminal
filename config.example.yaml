@@ -40,6 +40,9 @@ local:
   # Folders a tab (and an OpsAPI task link) may open, with their subfolders, e.g. [~/projects].
   # Empty: tabs always start in working_dir and task links are refused.
   allowed_roots: []
+  # Run shells as this account (through sudo), not the gateway's own, so they can't read the gateway's
+  # config, secrets, TLS key or logs. Needs packaging/sshweb.sudoers; see docs/OPSAPI.md.
+  run_as: null
 
 remote:
   enabled: false

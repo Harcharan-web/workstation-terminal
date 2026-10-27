@@ -190,8 +190,11 @@ real PTY, running as the user who runs sshweb. Users can choose any shell listed
   (target, name, session) is saved on the server per user (`<state_dir>/workspaces/<user>.json`, mode 0600).
   Signing in again in any browser restores it; see [Tabs and resuming](#tabs-and-resuming).
 
-Every gateway identity gets a shell as the **same macOS user** (the one running sshweb). sshweb runs
-unprivileged and can't switch users. Run separate instances under separate accounts if you need separation.
+Every gateway identity gets a shell as the **same macOS user**: the one running sshweb, or the account
+named in `local.run_as`. With `run_as`, sshweb (unprivileged, under its own account) starts shells as that
+account through a narrow sudo rule, so what runs in a terminal can't read the gateway's config, secrets,
+TLS key or logs: see [Shells as another account](docs/OPSAPI.md#shells-as-another-account). Signals to
+those shells also go through that rule.
 
 ## OpsAPI task links
 
@@ -400,6 +403,7 @@ Design notes and the decision log are in [PLAN.md](PLAN.md). The wire protocol i
 ```sh
 cargo test                      # unit + integration tests (real PTYs, real ssh/sshd, real ssh-keygen)
 cargo clippy --all-targets -- -D warnings
+scripts/test-run-as.sh          # local.run_as for real: two accounts + the sudoers rule in a Linux container (Docker)
 ```
 
 The integration tests use temporary directories and throwaway keys. The remote tests start a
@@ -422,6 +426,8 @@ The manual browser test procedure, including vim, is in [docs/TESTING.md](docs/T
 | `Permission denied (publickey)` | The profile's `identity_file` or agent key isn't authorised on the remote host. |
 | `admin socket path … too long` | Set `server.state_dir` / `SSHWEB_STATE_DIR` to a shorter path (macOS socket paths max 103 bytes). |
 | `another sshweb instance is running` | Stop it, or use a different `state_dir` and port. |
+| `local.run_as: sudo won't start shells …` (or `… stays running …`, `… drops the terminal's variables`) | The sudoers rule is missing or changed: install `packaging/sshweb.sudoers` (names adjusted) with `visudo -cf` first. |
+| `the gateway's account can't reach <folder>` | With `run_as`, the gateway still checks and enters tab folders: `chmod +a "user:_sshweb allow search" /Users/<account>`. |
 | Remote terminal asks for a passphrase | The identity file is encrypted; prefer `use_agent: true` with the key loaded in ssh-agent. |
 | Terminal size wrong after a resize | Press **Reconnect**. Size is re-sent on attach. |
 
@@ -434,6 +440,7 @@ Read [docs/SECURITY.md](docs/SECURITY.md) for the threat model. In short:
 - Copy-paste signing can't technically bind the signature to the page the way WebAuthn does. Users
   must check the origin in the challenge before signing.
 - All identities share one macOS account, and isolation between gateway users is by policy only.
+  `local.run_as` separates that account from the gateway itself, not people from each other.
 - Passphrases typed into a remote session (encrypted identity files) pass through the gateway's memory.
   They're never logged, but prefer ssh-agent.
 - State (logins, lockouts) is in memory. A restart logs everyone out and clears lockouts.

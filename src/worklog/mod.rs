@@ -504,6 +504,7 @@ mod tests {
             cwd: "/srv/site".into(),
             cols: 80,
             rows: 24,
+            run_as: None,
         }
     }
 
