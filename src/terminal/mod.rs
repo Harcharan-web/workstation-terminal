@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -11,13 +12,15 @@ use bytes::Bytes;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::{mpsc, watch};
 
-use crate::config::Config;
+use crate::config::{Account, Config};
 
 pub const MIN_COLS: u16 = 2;
 pub const MAX_COLS: u16 = 1000;
 pub const MIN_ROWS: u16 = 1;
 pub const MAX_ROWS: u16 = 500;
 const READ_CHUNK: usize = 16 * 1024;
+/// Starts shells as `local.run_as` (see packaging/sshweb.sudoers).
+pub const SUDO: &str = "/usr/bin/sudo";
 
 /// What to run inside the PTY. Arguments are passed as a vector; nothing goes through a shell.
 #[derive(Debug, Clone)]
@@ -29,6 +32,8 @@ pub struct PtySpec {
     pub cwd: PathBuf,
     pub cols: u16,
     pub rows: u16,
+    /// Run the program as this account through sudo (`local.run_as`); None: as the gateway.
+    pub run_as: Option<String>,
 }
 
 pub fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
@@ -83,12 +88,25 @@ pub fn local_shell_spec(
     if cfg.local.login_shell {
         args.push(OsString::from("-l"));
     }
-    let cwd = cfg
-        .local
-        .working_dir
-        .clone()
-        .unwrap_or_else(crate::config::home_dir);
+    let account = match &cfg.local.run_as {
+        Some(u) => Some(
+            crate::config::lookup_account(u)
+                .ok_or_else(|| format!("local.run_as account {u} does not exist"))?,
+        ),
+        None => None,
+    };
+    let cwd = cfg.local.working_dir.clone().unwrap_or_else(|| match &account {
+        Some(a) => a.home.clone(),
+        None => crate::config::home_dir(),
+    });
     let mut env = base_env();
+    if let Some(a) = &account {
+        // The shell's own identity, not the gateway's (sudo sets the same; TMPDIR was the gateway's).
+        env.retain(|(k, _)| !matches!(k.as_str(), "HOME" | "USER" | "LOGNAME" | "TMPDIR"));
+        env.push(("HOME".into(), a.home.to_string_lossy().into_owned()));
+        env.push(("USER".into(), a.name.clone()));
+        env.push(("LOGNAME".into(), a.name.clone()));
+    }
     env.push(("SHELL".into(), shell.to_string_lossy().into_owned()));
     let (cols, rows) = clamp_size(cols, rows);
     Ok(PtySpec {
@@ -98,7 +116,63 @@ pub fn local_shell_spec(
         cwd,
         cols,
         rows,
+        run_as: account.map(|a| a.name),
     })
+}
+
+/// `sudo` arguments that run `program args` as `user`. sudo's environment rules (sudoers env_keep)
+/// pass the terminal's variables; nothing secret goes on the command line.
+pub fn sudo_args(user: &str, program: &std::path::Path, args: &[OsString]) -> Vec<OsString> {
+    let mut v: Vec<OsString> = ["-n", "-H", "-u", user, "--"].map(OsString::from).into();
+    v.push(program.as_os_str().to_owned());
+    v.extend(args.iter().cloned());
+    v
+}
+
+/// Check that sudo lets this process start shells as `a` the way terminals need: no password, sudo
+/// replaced by the program (no root process in between, so the gateway can stop it), HOME set to
+/// the account's, and the terminal's variables kept.
+pub fn check_run_as(a: &Account) -> Result<(), String> {
+    let script = r#"printf '%s\n' "$$" "$(id -un)" "$HOME" "$OPSAPI_P$SSHWEB_P$OTEL_P$CLAUDE_CODE_P""#;
+    let args = sudo_args(&a.name, std::path::Path::new("/bin/sh"), &["-c".into(), script.into()]);
+    let child = std::process::Command::new(SUDO)
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .envs([("OPSAPI_P", "1"), ("SSHWEB_P", "2"), ("OTEL_P", "3"), ("CLAUDE_CODE_P", "4")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run {SUDO}: {e}"))?;
+    let pid = child.id().to_string();
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let rule = "install the rule from packaging/sshweb.sudoers";
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("sudo won't start shells as {}: {} ({rule})", a.name, why.trim()));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let got: Vec<&str> = text.lines().collect();
+    let home = a.home.to_string_lossy();
+    if got.first() != Some(&pid.as_str()) {
+        return Err(format!(
+            "sudo stays running between the gateway and the shell, so it couldn't stop shells: \
+             the sudoers Defaults must include !pam_session, !pam_setcred and !use_pty ({rule})"
+        ));
+    }
+    if got.get(1) != Some(&a.name.as_str()) {
+        return Err(format!("sudo started the shell as {:?}, not {}", got.get(1), a.name));
+    }
+    if got.get(2) != Some(&home.as_ref()) {
+        return Err(format!("shells get HOME {:?}, not {home}: add always_set_home ({rule})", got.get(2)));
+    }
+    if got.get(3) != Some(&"1234") {
+        return Err(format!(
+            "sudo drops the terminal's variables: env_keep must list OPSAPI_* SSHWEB_* OTEL_* CLAUDE_CODE_* ({rule})"
+        ));
+    }
+    Ok(())
 }
 
 /// A shell for an OpsAPI task: started in `cwd` with `extra_env`. With an agent command line
@@ -138,6 +212,7 @@ pub struct PtyProcess {
     master: Mutex<Box<dyn MasterPty + Send>>,
     input_tx: mpsc::Sender<Bytes>,
     pid: Option<i32>,
+    run_as: Option<String>,
     exit_rx: watch::Receiver<Option<ExitInfo>>,
 }
 
@@ -153,8 +228,18 @@ impl PtyProcess {
                 pixel_height: 0,
             })
             .context("openpty failed")?;
-        let mut cmd = CommandBuilder::new(&spec.program);
-        cmd.args(&spec.args);
+        let mut cmd = match &spec.run_as {
+            None => {
+                let mut c = CommandBuilder::new(&spec.program);
+                c.args(&spec.args);
+                c
+            }
+            Some(user) => {
+                let mut c = CommandBuilder::new(SUDO);
+                c.args(sudo_args(user, &spec.program, &spec.args));
+                c
+            }
+        };
         cmd.env_clear();
         for (k, v) in &spec.env {
             cmd.env(k, v);
@@ -222,6 +307,7 @@ impl PtyProcess {
                 master: Mutex::new(pair.master),
                 input_tx,
                 pid,
+                run_as: spec.run_as.clone(),
                 exit_rx,
             },
             out_rx,
@@ -277,6 +363,30 @@ impl PtyProcess {
     }
 
     fn signal_group(&self, sig: i32) {
+        if let (Some(pid), Some(user)) = (self.pid, &self.run_as)
+            && pid > 0
+        {
+            // The shell belongs to another account, so only that account (via sudo) may signal it.
+            // Its pid is its process group (setsid; sudo hands over without forking).
+            let name = match sig {
+                libc::SIGHUP => "HUP",
+                libc::SIGCONT => "CONT",
+                libc::SIGKILL => "KILL",
+                _ => "TERM",
+            };
+            let kill: Vec<OsString> = ["-s", name, "--"].map(OsString::from).into_iter()
+                .chain([OsString::from(format!("-{pid}"))])
+                .collect();
+            let _ = std::process::Command::new(SUDO)
+                .args(sudo_args(user, std::path::Path::new("/bin/kill"), &kill))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            return;
+        }
         if let Some(pid) = self.pid
             && pid > 0
         {
@@ -331,6 +441,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             cols: 80,
             rows: 24,
+            run_as: None,
         }
     }
 
@@ -412,6 +523,27 @@ mod tests {
         // SAFETY: probe only.
         let alive = unsafe { libc::kill(bg, 0) } == 0;
         assert!(!alive, "background child {bg} survived");
+    }
+
+    #[test]
+    fn sudo_args_keep_the_command_after_the_separator() {
+        let a = sudo_args("workstation", std::path::Path::new("/bin/zsh"), &["-l".into(), "-c".into(), "-u root".into()]);
+        let a: Vec<_> = a.iter().map(|x| x.to_string_lossy().into_owned()).collect();
+        assert_eq!(a, ["-n", "-H", "-u", "workstation", "--", "/bin/zsh", "-l", "-c", "-u root"]);
+    }
+
+    #[test]
+    fn without_run_as_the_shell_runs_as_the_gateway() {
+        let spec = local_shell_spec(&Config::default(), Some(std::path::Path::new("/bin/sh")), 80, 24).unwrap();
+        assert_eq!(spec.run_as, None);
+    }
+
+    #[test]
+    fn run_as_an_unknown_account_is_refused() {
+        let mut cfg = Config::default();
+        cfg.local.run_as = Some("no-such-account-sshweb".into());
+        let err = local_shell_spec(&cfg, Some(std::path::Path::new("/bin/sh")), 80, 24).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
     }
 
     #[test]

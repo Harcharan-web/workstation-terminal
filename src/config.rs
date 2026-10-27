@@ -205,6 +205,10 @@ pub struct LocalConfig {
     /// Folders a tab may be opened in (and their subfolders), e.g. `~/projects`. Empty: tabs
     /// always start in `working_dir` and launch links are refused.
     pub allowed_roots: Vec<PathBuf>,
+    /// Run local shells as this account (through sudo) instead of the gateway's own, so what they
+    /// run can't read the gateway's config, secrets, TLS key or logs. Needs the sudoers rule in
+    /// packaging/sshweb.sudoers; `config validate` checks it. Unset: shells run as the gateway.
+    pub run_as: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +391,7 @@ impl Default for LocalConfig {
             login_shell: true,
             working_dir: None,
             allowed_roots: Vec::new(),
+            run_as: None,
         }
     }
 }
@@ -474,6 +479,34 @@ pub fn default_config_dir() -> PathBuf {
 
 pub fn default_config_path() -> PathBuf {
     default_config_dir().join("config.yaml")
+}
+
+/// A local account from the user database.
+#[derive(Debug, Clone)]
+pub struct Account {
+    pub name: String,
+    pub uid: u32,
+    pub home: PathBuf,
+}
+
+/// Look an account up by name (getpwnam_r). None if it doesn't exist.
+pub fn lookup_account(name: &str) -> Option<Account> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    // SAFETY: an all-zero passwd is a valid out-parameter; getpwnam_r fills it and points its
+    // strings into `buf`, which outlives every use below. `out` is checked before reading.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe { libc::getpwnam_r(cname.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if rc != 0 || out.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    let home = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    Some(Account {
+        name: name.to_string(),
+        uid: pwd.pw_uid,
+        home: PathBuf::from(home.to_string_lossy().into_owned()),
+    })
 }
 
 pub fn home_dir() -> PathBuf {
@@ -619,6 +652,16 @@ impl Config {
                  set it to true explicitly to expose the gateway",
                 s.bind
             ));
+        }
+        if let Some(u) = &self.local.run_as {
+            let ok = !u.is_empty()
+                && u.len() <= 32
+                && u.bytes().enumerate().all(|(i, b)| {
+                    b == b'_' || b.is_ascii_lowercase() || (i > 0 && (b.is_ascii_digit() || b == b'-' || b == b'.'))
+                });
+            if !ok {
+                errs.push(format!("local.run_as {u:?} is not an account name sshweb can run shells as"));
+            }
         }
         if s.tls.cert.is_some() != s.tls.key.is_some() {
             errs.push("server.tls.cert and server.tls.key must be set together".into());
@@ -925,12 +968,37 @@ impl Config {
                 }
             }
         }
+        if self.local.enabled
+            && let Some(u) = &self.local.run_as
+        {
+            match lookup_account(u) {
+                None => errs.push(format!("local.run_as: there is no account {u:?}")),
+                Some(a) if a.uid == 0 => errs.push("local.run_as must not be root".into()),
+                // SAFETY: geteuid has no preconditions.
+                Some(a) if a.uid == unsafe { libc::geteuid() } => errs.push(format!(
+                    "local.run_as: {u:?} is the gateway's own account; run the gateway as another \
+                     account (that is the point) or remove run_as"
+                )),
+                Some(a) => {
+                    if let Err(e) = crate::terminal::check_run_as(&a) {
+                        errs.push(format!("local.run_as: {e}"));
+                    }
+                }
+            }
+        }
         for r in &self.local.allowed_roots {
-            if !r.is_dir() {
-                errs.push(format!(
+            match std::fs::metadata(r) {
+                Ok(m) if m.is_dir() => {}
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => errs.push(format!(
+                    "local.allowed_roots: the gateway's account can't reach {} (permission denied); \
+                     with run_as, give it search access to the folders above it, e.g. \
+                     `chmod +a \"user:<gateway account> allow search\" <home folder>`",
+                    r.display()
+                )),
+                _ => errs.push(format!(
                     "local.allowed_roots: {} is not a folder",
                     r.display()
-                ));
+                )),
             }
         }
         if self.remote.enabled {

@@ -1,0 +1,14 @@
+# /etc/sudoers.d/sshweb: lets the gateway's account (_sshweb) start terminals as the account people
+# work in (workstation), for `local.run_as: workstation`. See "Shells as another account" in
+# docs/OPSAPI.md. Check and install it with:
+#
+#     sudo visudo -cf sshweb.sudoers && sudo install -o root -g wheel -m 440 sshweb.sudoers /etc/sudoers.d/sshweb
+#
+# A shell can run anything, so allowing only shells would not narrow this: the rule lets _sshweb act
+# as workstation and nothing else, never as root or any other account. workstation gets no sudo.
+# The Defaults make sudo hand over to the shell without staying around as root (so the gateway can
+# stop shells), set HOME to the account's and keep only the terminal's own variables.
+# `sshweb config validate` checks all of this.
+Defaults:_sshweb !pam_session, !pam_setcred, !use_pty, !lecture, always_set_home
+Defaults:_sshweb env_keep = "PATH TERM COLORTERM TERM_PROGRAM LANG LC_ALL LC_CTYPE SHELL OPSAPI_* SSHWEB_* OTEL_* CLAUDE_CODE_*"
+_sshweb ALL=(workstation) NOPASSWD: ALL

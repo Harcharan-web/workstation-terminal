@@ -1,30 +1,31 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- launchd daemon for task terminals: runs sshweb at boot as the (non-root, non-admin) account
-     "workstation", without anyone logging in. See docs/OPSAPI.md. Install in /Library/LaunchDaemons. -->
+<!-- launchd daemon for task terminals: runs sshweb at boot as its hidden service account "_sshweb",
+     without anyone logging in; the terminals' shells run as "workstation" (local.run_as). See
+     docs/OPSAPI.md "A separate macOS account for task terminals". Install in /Library/LaunchDaemons. -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
   <string>com.sshweb.agents</string>
   <key>UserName</key>
-  <string>workstation</string>
+  <string>_sshweb</string>
   <key>GroupName</key>
-  <string>staff</string>
+  <string>_sshweb</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/workstation/.local/bin/sshweb</string>
+    <string>/usr/local/bin/sshweb</string>
     <string>serve</string>
     <string>--config</string>
-    <string>/Users/workstation/.sshweb/config.yaml</string>
+    <string>/usr/local/etc/sshweb/config.yaml</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
-    <string>/Users/workstation</string>
+    <string>/var/empty</string>
     <key>USER</key>
-    <string>workstation</string>
+    <string>_sshweb</string>
     <key>LOGNAME</key>
-    <string>workstation</string>
+    <string>_sshweb</string>
     <key>SHELL</key>
     <string>/bin/zsh</string>
     <key>PATH</key>
@@ -33,7 +34,7 @@
     <string>en_GB.UTF-8</string>
   </dict>
   <key>WorkingDirectory</key>
-  <string>/Users/workstation</string>
+  <string>/usr/local/var/sshweb</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -46,8 +47,8 @@
   <key>ProcessType</key>
   <string>Interactive</string>
   <key>StandardOutPath</key>
-  <string>/Users/workstation/Library/Logs/sshweb.log</string>
+  <string>/usr/local/var/sshweb/serve.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/workstation/Library/Logs/sshweb.log</string>
+  <string>/usr/local/var/sshweb/serve.log</string>
 </dict>
 </plist>
