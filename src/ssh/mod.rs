@@ -227,6 +227,7 @@ pub fn ssh_spec(cfg: &Config, t: &RemoteTarget, cols: u16, rows: u16) -> PtySpec
         rows,
         // The ssh client needs the gateway's known_hosts and keys, so it runs as the gateway.
         run_as: None,
+        sandbox: None,
     }
 }
 

@@ -21,6 +21,8 @@ pub const MAX_ROWS: u16 = 500;
 const READ_CHUNK: usize = 16 * 1024;
 /// Starts shells as `local.run_as` (see packaging/sshweb.sudoers).
 pub const SUDO: &str = "/usr/bin/sudo";
+/// Runs shells inside `local.sandbox_profile` (macOS).
+pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// What to run inside the PTY. Arguments are passed as a vector; nothing goes through a shell.
 #[derive(Debug, Clone)]
@@ -34,6 +36,63 @@ pub struct PtySpec {
     pub rows: u16,
     /// Run the program as this account through sudo (`local.run_as`); None: as the gateway.
     pub run_as: Option<String>,
+    /// Run the program inside this sandbox (`local.sandbox_profile`); None: unsandboxed.
+    pub sandbox: Option<Sandbox>,
+}
+
+/// A sandbox-exec profile and the parameters it gets (`-D KEY=value`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sandbox {
+    pub profile: PathBuf,
+    pub params: Vec<(String, String)>,
+}
+
+/// The account local shells run as and the sandbox they run in, from the config.
+fn shell_context(cfg: &Config) -> Result<(Option<Account>, Option<Sandbox>), String> {
+    let account = match &cfg.local.run_as {
+        Some(u) => Some(
+            crate::config::lookup_account(u)
+                .ok_or_else(|| format!("local.run_as account {u} does not exist"))?,
+        ),
+        None => None,
+    };
+    let sandbox = cfg.local.sandbox_profile.as_ref().map(|profile| {
+        let home = match &account {
+            Some(a) => a.home.clone(),
+            None => crate::config::home_dir(),
+        };
+        Sandbox {
+            profile: profile.clone(),
+            params: vec![
+                ("HOME".into(), home.to_string_lossy().into_owned()),
+                ("OTLP_PORT".into(), cfg.opsapi.work_log.otlp_port.to_string()),
+            ],
+        }
+    });
+    Ok((account, sandbox))
+}
+
+/// What actually starts for `spec`: its program inside its sandbox, as its account. Each step
+/// (sudo, sandbox-exec) replaces itself with the next, so the pid is the program's.
+pub fn command_line(spec: &PtySpec) -> (PathBuf, Vec<OsString>) {
+    let mut program = spec.program.clone();
+    let mut args = spec.args.clone();
+    if let Some(sb) = &spec.sandbox {
+        let mut a: Vec<OsString> = vec!["-f".into(), sb.profile.clone().into()];
+        for (k, v) in &sb.params {
+            a.push("-D".into());
+            a.push(format!("{k}={v}").into());
+        }
+        a.push(program.into());
+        a.extend(args);
+        program = SANDBOX_EXEC.into();
+        args = a;
+    }
+    if let Some(user) = &spec.run_as {
+        args = sudo_args(user, &program, &args);
+        program = SUDO.into();
+    }
+    (program, args)
 }
 
 pub fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
@@ -88,13 +147,7 @@ pub fn local_shell_spec(
     if cfg.local.login_shell {
         args.push(OsString::from("-l"));
     }
-    let account = match &cfg.local.run_as {
-        Some(u) => Some(
-            crate::config::lookup_account(u)
-                .ok_or_else(|| format!("local.run_as account {u} does not exist"))?,
-        ),
-        None => None,
-    };
+    let (account, sandbox) = shell_context(cfg)?;
     let cwd = cfg.local.working_dir.clone().unwrap_or_else(|| match &account {
         Some(a) => a.home.clone(),
         None => crate::config::home_dir(),
@@ -117,7 +170,45 @@ pub fn local_shell_spec(
         cols,
         rows,
         run_as: account.map(|a| a.name),
+        sandbox,
     })
+}
+
+/// Check that local shells start inside `local.sandbox_profile`: the profile loads, and the
+/// shell is still the process the gateway holds (so it can be stopped).
+pub fn check_sandbox(cfg: &Config) -> Result<(), String> {
+    let (account, sandbox) = shell_context(cfg)?;
+    let spec = PtySpec {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "echo \"$$\"".into()],
+        env: base_env(),
+        cwd: std::env::temp_dir(),
+        cols: 80,
+        rows: 24,
+        run_as: account.map(|a| a.name),
+        sandbox,
+    };
+    let (program, args) = command_line(&spec);
+    let child = std::process::Command::new(&program)
+        .args(&args)
+        .env_clear()
+        .envs(spec.env.iter().map(|(k, v)| (k, v)))
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run {}: {e}", program.display()))?;
+    let pid = child.id().to_string();
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("a test shell didn't start in the sandbox: {}", why.trim()));
+    }
+    if String::from_utf8_lossy(&out.stdout).trim() != pid {
+        return Err("sandbox-exec didn't hand over to the shell".into());
+    }
+    Ok(())
 }
 
 /// `sudo` arguments that run `program args` as `user`. sudo's environment rules (sudoers env_keep)
@@ -228,18 +319,9 @@ impl PtyProcess {
                 pixel_height: 0,
             })
             .context("openpty failed")?;
-        let mut cmd = match &spec.run_as {
-            None => {
-                let mut c = CommandBuilder::new(&spec.program);
-                c.args(&spec.args);
-                c
-            }
-            Some(user) => {
-                let mut c = CommandBuilder::new(SUDO);
-                c.args(sudo_args(user, &spec.program, &spec.args));
-                c
-            }
-        };
+        let (program, args) = command_line(spec);
+        let mut cmd = CommandBuilder::new(&program);
+        cmd.args(&args);
         cmd.env_clear();
         for (k, v) in &spec.env {
             cmd.env(k, v);
@@ -442,6 +524,7 @@ mod tests {
             cols: 80,
             rows: 24,
             run_as: None,
+            sandbox: None,
         }
     }
 
@@ -530,6 +613,26 @@ mod tests {
         let a = sudo_args("workstation", std::path::Path::new("/bin/zsh"), &["-l".into(), "-c".into(), "-u root".into()]);
         let a: Vec<_> = a.iter().map(|x| x.to_string_lossy().into_owned()).collect();
         assert_eq!(a, ["-n", "-H", "-u", "workstation", "--", "/bin/zsh", "-l", "-c", "-u root"]);
+    }
+
+    #[test]
+    fn the_command_line_wraps_the_shell_in_its_sandbox_then_its_account() {
+        let mut spec = sh_spec("true");
+        spec.program = "/bin/zsh".into();
+        spec.args = vec!["-l".into()];
+        assert_eq!(command_line(&spec), ("/bin/zsh".into(), vec!["-l".into()]));
+        spec.sandbox = Some(Sandbox {
+            profile: "/usr/local/etc/sshweb/shell.sb".into(),
+            params: vec![("HOME".into(), "/Users/workstation".into()), ("OTLP_PORT".into(), "7683".into())],
+        });
+        spec.run_as = Some("workstation".into());
+        let (program, args) = command_line(&spec);
+        let args: Vec<_> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(program, std::path::Path::new(SUDO));
+        assert_eq!(args, [
+            "-n", "-H", "-u", "workstation", "--", SANDBOX_EXEC, "-f", "/usr/local/etc/sshweb/shell.sb",
+            "-D", "HOME=/Users/workstation", "-D", "OTLP_PORT=7683", "/bin/zsh", "-l",
+        ]);
     }
 
     #[test]

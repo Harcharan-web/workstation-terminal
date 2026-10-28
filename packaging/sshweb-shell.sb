@@ -1,0 +1,43 @@
+;; Sandbox for terminal shells (local.sandbox_profile), macOS. See docs/OPSAPI.md
+;; "Shells locked to their folder". Install root-owned, e.g. /usr/local/etc/sshweb/shell.sb (0644).
+;; Parameters from sshweb: HOME (the shells' account folder) and OTLP_PORT (the work log's receiver).
+;; Everything a shell starts (agents, git, builds) inherits it and can't loosen it.
+(version 1)
+(allow default)
+
+;; Files. Of everything under /Users only the account's own folder: its projects and the tools'
+;; settings and caches. No other account's files, and no disks under /Volumes.
+(deny file-read* file-write* (subpath "/Users") (subpath "/Volumes"))
+(allow file-read-metadata (literal "/Users"))
+(allow file-read* file-write* (subpath (param "HOME")))
+;; Shared set-up stays as the administrator left it: shell start-up files, the agents' Claude and
+;; GitHub logins, git's identity and Claude's user settings (hooks there would run for everyone).
+(deny file-write*
+  (literal (string-append (param "HOME") "/.zprofile"))
+  (literal (string-append (param "HOME") "/.zshrc"))
+  (literal (string-append (param "HOME") "/.zshenv"))
+  (literal (string-append (param "HOME") "/.zlogin"))
+  (literal (string-append (param "HOME") "/.profile"))
+  (literal (string-append (param "HOME") "/.bash_profile"))
+  (literal (string-append (param "HOME") "/.bashrc"))
+  (literal (string-append (param "HOME") "/.claude-token"))
+  (literal (string-append (param "HOME") "/.gitconfig"))
+  (literal (string-append (param "HOME") "/.claude/settings.json"))
+  (subpath (string-append (param "HOME") "/.config/gh"))
+  (subpath (string-append (param "HOME") "/.config/git")))
+
+;; Network. Out to the web only (GitHub, Claude, OpsAPI, package registries): ports 443 and 80.
+;; Nothing else, so not the services running on this Mac or the local network (databases, AI
+;; servers, dashboards, file and screen sharing). Exceptions on this Mac: the work log's receiver
+;; and the usual ports of a dev server someone starts in their own terminal.
+(deny network-outbound (remote ip "*:*"))
+(allow network-outbound
+  (remote tcp "*:443")
+  (remote tcp "*:80")
+  (remote ip (string-append "localhost:" (param "OTLP_PORT")))
+  (remote ip "localhost:3000")
+  (remote ip "localhost:3001")
+  (remote ip "localhost:4173")
+  (remote ip "localhost:5173")
+  (remote ip "localhost:8000")
+  (remote unix-socket))

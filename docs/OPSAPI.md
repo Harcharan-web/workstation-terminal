@@ -368,6 +368,25 @@ local <key>.pub`. Admin commands talk to the running gateway as its account:
 Finally route a public name to it (reverse proxy → `https://<mac>:7682`, see "Behind a reverse proxy"
 in the README) and enter that address in OpsAPI.
 
+### Shells locked to their folder
+
+`local.sandbox_profile: /usr/local/etc/sshweb/shell.sb` (macOS) runs every local shell inside a
+sandbox (`sandbox-exec`) that everything started from it inherits and can't loosen. The profile in
+[packaging/sshweb-shell.sb](../packaging/sshweb-shell.sb):
+
+- **files:** under `/Users` only the shells' own account folder (the projects plus the tools'
+  settings and caches); no other account's files, no `/Volumes`. The shared set-up is read-only:
+  shell start-up files, the agents' Claude and GitHub logins, git's identity, Claude's user settings;
+- **network:** out on ports 443 and 80 only (GitHub over https, Claude, OpsAPI, package registries).
+  Not the services on this Mac or the local network (databases, AI servers, dashboards, file and
+  screen sharing), not ssh. On this Mac only the work log's receiver (`OTLP_PORT`) and a few usual
+  dev-server ports (3000, 3001, 4173, 5173, 8000) a person starts in their own terminal.
+
+sshweb passes `HOME` (the account's folder) and `OTLP_PORT` and starts
+`sudo … sandbox-exec -f <profile> -D … <shell>`; each step hands over to the next, so the gateway still
+stops the shell. `config validate` starts a test shell in it. Install the profile root-owned (0644).
+Administrators set the account up (logins, repos) outside the sandbox: `sudo -u workstation -i`.
+
 What this separates and what it doesn't: the gateway, its secret and its records from everything run in a
 terminal (real), and the terminals from the owner's account (real). People sharing `workstation` can
 still see and change each other's work in it, including each other's tab tokens: separation between

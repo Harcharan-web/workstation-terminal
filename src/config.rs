@@ -209,6 +209,11 @@ pub struct LocalConfig {
     /// run can't read the gateway's config, secrets, TLS key or logs. Needs the sudoers rule in
     /// packaging/sshweb.sudoers; `config validate` checks it. Unset: shells run as the gateway.
     pub run_as: Option<String>,
+    /// macOS only: run local shells inside this sandbox profile (`sandbox-exec`), e.g.
+    /// packaging/sshweb-shell.sb, which keeps them to their account's folder and the web. It gets
+    /// `HOME` (the shells' home) and `OTLP_PORT` (the work log's receiver) as parameters. Must be
+    /// owned by root (or the gateway) and not writable by others; `config validate` tries it.
+    pub sandbox_profile: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,6 +397,7 @@ impl Default for LocalConfig {
             working_dir: None,
             allowed_roots: Vec::new(),
             run_as: None,
+            sandbox_profile: None,
         }
     }
 }
@@ -984,6 +990,20 @@ impl Config {
                         errs.push(format!("local.run_as: {e}"));
                     }
                 }
+            }
+        }
+        if self.local.enabled
+            && let Some(p) = &self.local.sandbox_profile
+        {
+            if let Err(e) = perms::check_admin_file(p) {
+                errs.push(format!("local.sandbox_profile: {e}"));
+            } else if !Path::new(crate::terminal::SANDBOX_EXEC).is_file() {
+                errs.push(format!(
+                    "local.sandbox_profile needs {} (macOS)",
+                    crate::terminal::SANDBOX_EXEC
+                ));
+            } else if let Err(e) = crate::terminal::check_sandbox(self) {
+                errs.push(format!("local.sandbox_profile: {e}"));
             }
         }
         for r in &self.local.allowed_roots {
