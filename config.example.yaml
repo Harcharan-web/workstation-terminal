@@ -43,6 +43,9 @@ local:
   # Run shells as this account (through sudo), not the gateway's own, so they can't read the gateway's
   # config, secrets, TLS key or logs. Needs packaging/sshweb.sudoers; see docs/OPSAPI.md.
   run_as: null
+  # macOS: run shells inside this sandbox profile (e.g. packaging/sshweb-shell.sb, root-owned) so they keep
+  # to their account's folder and the web. See docs/OPSAPI.md "Shells locked to their folder".
+  sandbox_profile: null
 
 remote:
   enabled: false

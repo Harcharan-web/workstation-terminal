@@ -194,7 +194,8 @@ Every gateway identity gets a shell as the **same macOS user**: the one running 
 named in `local.run_as`. With `run_as`, sshweb (unprivileged, under its own account) starts shells as that
 account through a narrow sudo rule, so what runs in a terminal can't read the gateway's config, secrets,
 TLS key or logs: see [Shells as another account](docs/OPSAPI.md#shells-as-another-account). Signals to
-those shells also go through that rule.
+those shells also go through that rule. On macOS, `local.sandbox_profile` also keeps them to their folder and the
+web: see [Shells locked to their folder](docs/OPSAPI.md#shells-locked-to-their-folder).
 
 ## OpsAPI task links
 
