@@ -50,9 +50,12 @@ ssh-keygen -q -t ed25519 -N '' -f "$SSHWEB_HOME/testkey"
 ./target/release/sshweb serve
 ```
 
-1. **Login.** Open `http://127.0.0.1:7681/`, enter `tester`, put `$SSHWEB_HOME/testkey` in the key field
-   and press *Get challenge*. Check the origin in the shown message. Run the command and paste.
-   ✅ Signed in. ❌ Paste a signature from an older challenge: *authentication failed*.
+1. **Login.** Open `http://127.0.0.1:7681/?user=tester` (the user is filled in), pick `$SSHWEB_HOME/testkey`
+   as the key file, type its passphrase if it has one and press *Sign in*. ✅ Signed in. ❌ A wrong passphrase:
+   *That passphrase isn't right*; another user's name: *That key doesn't belong to …*.
+   Then *Sign in with a command instead*: put `$SSHWEB_HOME/testkey` in the key field and press *Get challenge*.
+   Check the origin in the shown message. Run the command and paste. ✅ Signed in. ❌ Paste a signature from an
+   older challenge: *authentication failed*.
 2. **Shell.** Choose *This Mac*, then *Connect*. Run `echo $TERM` (expect `xterm-256color`), `ls --color`
    or `ls -G`, and `printf '\e[31mred\e[0m\n'`. ✅ Colours render.
 3. **Full screen.** Run `vim`, type `ihello<Esc>`, `:q!`. Run `top` and quit with `q`. Run `less /etc/services` and quit with `q`.

@@ -64,6 +64,16 @@ the resulting login is used only by that socket (no cookie is issued). See [PROT
 
 ## Signing options for users
 
+**In the page (the default).** Pick the key file and type its passphrase. `web/keysign.js` opens the
+OpenSSH key in the browser (unencrypted, or `bcrypt` + `aes256-ctr` as `ssh-keygen -N` writes it; Ed25519
+only) and makes the same SSHSIG signature `ssh-keygen -Y sign` would, over the message the challenge
+gave. Only the signature is sent. The trade-off: the key is opened by JavaScript this gateway served, so a
+page at another origin that someone is tricked into using could take the key and passphrase. Keep the
+manager-issued keys short-lived (OpsAPI: 90 days, blockable at once), and use a command below where that
+matters. A link may name the user (`/?user=alice`) so people only pick the file.
+
+**With a command:**
+
 ```sh
 # Key file (prompts locally if passphrase-protected):
 printf '%s' 'MESSAGE' | ssh-keygen -Y sign -n sshweb-auth -f ~/.ssh/id_ed25519 | pbcopy

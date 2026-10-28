@@ -43,15 +43,19 @@ cargo build --release
 ./target/release/sshweb serve                             # http://127.0.0.1:7681/
 ```
 
-Open <http://127.0.0.1:7681/>, enter your user name and press **Get challenge**. Run the command
-the page shows in any terminal on your Mac:
+Open <http://127.0.0.1:7681/>, enter your user name, pick your key file, type its passphrase (if it has one) and
+press **Sign in**. The page opens the key and signs the one-time challenge in the browser; nothing but the
+signature is sent. Then pick **This Mac** and press **Open in new tab**.
+
+Prefer your own tools? Open **Sign in with a command instead**, press **Get challenge** and run the command the
+page shows in any terminal on your Mac:
 
 ```sh
 printf '%s' 'sshweb-auth-v1 origin=http://127.0.0.1:7681 user=alice challenge=… nonce=… expires=…' \
   | ssh-keygen -Y sign -n sshweb-auth -f ~/.ssh/id_ed25519 | pbcopy
 ```
 
-Paste the signature into the page and press **Sign in**. Then pick **This Mac** and press **Connect**.
+Paste the signature into the page and press **Sign in**.
 
 No key yet? Create one with `ssh-keygen -t ed25519`.
 

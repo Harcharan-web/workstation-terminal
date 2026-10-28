@@ -85,6 +85,8 @@ button.wide { width: 100%; margin-top: 10px; }
 .card h2 { font-size: 14px; margin: 22px 0 8px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
 .login form { margin: 14px 0; }
 .login label { color: var(--muted); }
+.login .stack { display: flex; flex-direction: column; gap: 6px; max-width: 420px; }
+.login .stack label { margin-top: 6px; }
 .cmd { display: flex; gap: 8px; align-items: flex-start; }
 .cmd pre {
   flex: 1; margin: 0; padding: 10px; background: var(--panel-2); border: 1px solid var(--border);
