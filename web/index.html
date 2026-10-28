@@ -26,40 +26,56 @@
   <!-- Login -->
   <main id="view-login" class="view hidden">
     <section class="card login">
-      <h1>Sign in with your SSH key</h1>
-      <p class="muted">Your private key never leaves your machine. You sign a one-time challenge
-        locally with <code>ssh-keygen</code> and paste the signature here.</p>
+      <h1>Sign in</h1>
+      <p class="muted">Use the key file and passphrase your manager gave you. This page opens the key here, on your
+        computer: the key and passphrase are never sent anywhere.</p>
 
-      <form id="form-user" class="row" autocomplete="off">
-        <label for="login-user">User</label>
+      <form id="form-keyfile" class="stack" autocomplete="off">
+        <label for="login-user">1. Your user name</label>
         <input id="login-user" name="user" required maxlength="32" pattern="[a-z_][a-z0-9_.\-]*" spellcheck="false" autocapitalize="off">
-        <label for="login-key">Key file</label>
-        <input id="login-key" value="~/.ssh/id_ed25519" spellcheck="false" autocapitalize="off">
-        <button type="submit" class="primary">Get challenge</button>
+        <label for="login-file">2. Your key file <span class="muted">(it ends in .key)</span></label>
+        <input id="login-file" type="file" required>
+        <label for="login-pass">3. The key's passphrase</label>
+        <input id="login-pass" type="password" autocomplete="off" spellcheck="false">
+        <div class="row">
+          <button type="submit" class="primary" id="btn-keyfile">Sign in</button>
+          <span class="muted" id="keyfile-busy" role="status"></span>
+        </div>
       </form>
 
-      <div id="challenge-step" class="hidden">
-        <p>1. Run this in a terminal on <strong>your</strong> computer. It signs the challenge and copies the signature
-          (on macOS, <code>pbcopy</code>). Check that the origin in the message is this gateway.</p>
-        <div class="cmd">
-          <pre id="sign-cmd"></pre>
-          <button type="button" id="btn-copy-cmd" class="ghost">Copy</button>
-        </div>
-        <details>
-          <summary>Other ways to sign</summary>
-          <p class="muted">With the sshweb binary: <code id="alt-cmd"></code></p>
-          <p class="muted">Key in ssh-agent: point <code>-f</code> at the <code>.pub</code> file.
-            Encrypted keys prompt for their passphrase locally.</p>
-        </details>
-        <form id="form-sig">
-          <p>2. Paste the signature (<code>-----BEGIN SSH SIGNATURE-----</code> …):</p>
-          <textarea id="login-sig" rows="7" spellcheck="false" required></textarea>
-          <div class="row">
-            <button type="submit" class="primary">Sign in</button>
-            <span class="muted" id="challenge-expiry"></span>
-          </div>
+      <details id="cmd-way">
+        <summary>Sign in with a command instead (for people who use SSH)</summary>
+        <p class="muted">Sign a one-time challenge on your computer with <code>ssh-keygen</code> and paste the
+          signature here. Uses the user name above.</p>
+        <form id="form-user" class="row" autocomplete="off">
+          <label for="login-key">Key file</label>
+          <input id="login-key" value="~/.ssh/id_ed25519" spellcheck="false" autocapitalize="off">
+          <button type="submit">Get challenge</button>
         </form>
-      </div>
+
+        <div id="challenge-step" class="hidden">
+          <p>1. Run this in a terminal on <strong>your</strong> computer. It signs the challenge and copies the signature
+            (on macOS, <code>pbcopy</code>). Check that the origin in the message is this gateway.</p>
+          <div class="cmd">
+            <pre id="sign-cmd"></pre>
+            <button type="button" id="btn-copy-cmd" class="ghost">Copy</button>
+          </div>
+          <details>
+            <summary>Other ways to sign</summary>
+            <p class="muted">With the sshweb binary: <code id="alt-cmd"></code></p>
+            <p class="muted">Key in ssh-agent: point <code>-f</code> at the <code>.pub</code> file.
+              Encrypted keys prompt for their passphrase locally.</p>
+          </details>
+          <form id="form-sig">
+            <p>2. Paste the signature (<code>-----BEGIN SSH SIGNATURE-----</code> …):</p>
+            <textarea id="login-sig" rows="7" spellcheck="false" required></textarea>
+            <div class="row">
+              <button type="submit" class="primary">Sign in</button>
+              <span class="muted" id="challenge-expiry"></span>
+            </div>
+          </form>
+        </div>
+      </details>
       <p class="muted hidden" id="login-launch" role="status"></p>
       <p class="error" id="login-error" role="alert"></p>
     </section>
@@ -150,6 +166,9 @@
 
   <script src="/assets/vendor/xterm.js"></script>
   <script src="/assets/vendor/addon-fit.js"></script>
+  <script src="/assets/vendor/nacl-fast.min.js"></script>
+  <script src="/assets/vendor/bcrypt-pbkdf.js"></script>
+  <script src="/assets/keysign.js"></script>
   <script src="/assets/app.js"></script>
 </body>
 </html>

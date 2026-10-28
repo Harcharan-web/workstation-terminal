@@ -702,13 +702,43 @@
       : "";
     $("login-launch").classList.toggle("hidden", !waiting);
     $("challenge-step").classList.add("hidden");
-    $("login-user").focus();
+    ($("login-user").value ? $("login-file") : $("login-user")).focus();
   }
+
+  // The usual way: pick the key file, type its passphrase; this page signs the challenge (keysign.js).
+  $("form-keyfile").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    $("login-error").textContent = "";
+    const user = $("login-user").value.trim();
+    const file = $("login-file").files[0];
+    if (!file) { $("login-error").textContent = "Pick your key file."; return; }
+    $("btn-keyfile").disabled = true;
+    $("keyfile-busy").textContent = "Opening your key…";
+    try {
+      const key = await window.KeySign.openKey(await file.text(), $("login-pass").value);
+      $("keyfile-busy").textContent = "Signing in…";
+      const ch = await api("POST", "/api/auth/challenge", { user });
+      const signature = await window.KeySign.sign(key, ch.message, ch.namespace);
+      await api("POST", "/api/auth/verify", { challenge_id: ch.challenge_id, signature });
+    } catch (err) {
+      $("login-error").textContent = err.code === "auth_failed"
+        ? "That key doesn't belong to “" + user + "”. Check your user name and key file, or ask your manager for a new key."
+        : err.message;
+      return;
+    } finally {
+      $("btn-keyfile").disabled = false;
+      $("keyfile-busy").textContent = "";
+    }
+    try { localStorage.setItem("sshweb.lastUser", user); } catch (_) { /* ignore */ }
+    $("login-pass").value = "";
+    await enter();
+  });
 
   $("form-user").addEventListener("submit", async (e) => {
     e.preventDefault();
     $("login-error").textContent = "";
     const user = $("login-user").value.trim();
+    if (!user) { $("login-error").textContent = "Type your user name first."; $("login-user").focus(); return; }
     try {
       challenge = await api("POST", "/api/auth/challenge", { user });
     } catch (err) {
@@ -836,7 +866,10 @@
   $("set-meta").checked = !!prefs.optionMeta;
   document.documentElement.setAttribute("data-theme", prefs.theme);
   try {
-    $("login-user").value = localStorage.getItem("sshweb.lastUser") || "";
+    // A link from OpsAPI can name the user (?user=…), so people only pick their key file.
+    const linked = new URLSearchParams(location.search).get("user");
+    $("login-user").value = (linked && /^[a-z_][a-z0-9_.-]{0,31}$/.test(linked) ? linked : "") ||
+      localStorage.getItem("sshweb.lastUser") || "";
     $("login-key").value = localStorage.getItem("sshweb.keyPath") || "~/.ssh/id_ed25519";
   } catch (_) { /* ignore */ }
   window.addEventListener("online", () => {
