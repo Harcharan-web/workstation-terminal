@@ -416,20 +416,60 @@ sandbox (`sandbox-exec`) that everything started from it inherits and can't loos
 [packaging/sshweb-shell.sb](../packaging/sshweb-shell.sb):
 
 - **files:** under `/Users` only the shells' own account folder (the projects plus the tools'
-  settings and caches); no other account's files, no `/Volumes`. The shared set-up is read-only:
-  shell start-up files, the agents' Claude and GitHub logins, git's identity, Claude's user settings;
+  settings and caches); no other account's files, no `/Volumes`. What runs in everyone's sessions is
+  read-only, so nobody can plant something there that runs when a colleague starts a shell or Claude:
+  shell start-up files (`~/.zshrc` and friends, `~/.oh-my-zsh`, `~/.zsh`), the folders on PATH in the
+  home (`~/bin`, `~/.local/bin`) and the Claude that `~/.local/bin/claude` points to
+  (`~/.local/share/claude`), the agents' Claude and GitHub logins, git's identity, and what Claude loads
+  for everyone: its user settings, `CLAUDE.md`, commands, agents, skills, plugins and hooks. Their folders
+  (`~/.claude`, `~/.config`, `~/.local`) can't be moved aside and replaced by a link either. Claude keeps
+  its own state as usual (`~/.claude.json`, `~/.claude/projects`, todos and the rest). It can't update
+  itself from a tab: update it as the account, `sudo -iu workstation claude update`;
+- **processes:** a shell can inspect (open files, folder, path) and signal only what was started in its own
+  tab, not another person's shell or agent and not the gateway. Job control (Ctrl+Z, `bg`, `kill %1`) and
+  Ctrl+C work as usual. `ps` and `top` don't run inside any sandbox (they are setuid); `pgrep` does;
 - **network:** out on ports 443 and 80 only (GitHub over https, Claude, OpsAPI, package registries).
   Not the services on this Mac or the local network (databases, AI servers, dashboards, file and
   screen sharing), not ssh. On this Mac only the work log's receiver (`OTLP_PORT`) and a few usual
   dev-server ports (3000, 3001, 4173, 5173, 8000) a person starts in their own terminal.
 
+A sandbox profile can't name address ranges, so hosts on the local network stay reachable on 443 and 80.
+Block those with pf, for the shells' account only, e.g. `/etc/pf.anchors/sshweb`:
+
+```
+# The shells' account may not reach the local network.
+block return out quick proto { tcp, udp } from any to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, fc00::/7, fe80::/10 } user workstation
+```
+
+Add `anchor "sshweb"` and `load anchor "sshweb" from "/etc/pf.anchors/sshweb"` to `/etc/pf.conf`, check
+with `sudo pfctl -vnf /etc/pf.conf`, then `sudo pfctl -E -f /etc/pf.conf`. pf isn't on at boot unless a
+LaunchDaemon turns it on, and macOS updates can restore `/etc/pf.conf`. Check from a tab:
+`nc -z -G 2 <a host on the local network> 443` should fail. (This project's tests don't cover pf.)
+
 sshweb passes `HOME` (the account's folder) and `OTLP_PORT` and starts
 `sudo … sandbox-exec -f <profile> -D … <shell>`; each step hands over to the next, so the gateway still
 stops the shell. `config validate` starts a test shell in it. Install the profile root-owned (0644).
-Administrators set the account up (logins, repos) outside the sandbox: `sudo -u workstation -i`.
+Administrators set the account up (logins, repos, tools, Claude's commands and skills) outside the
+sandbox: `sudo -u workstation -i`.
 
 What this separates and what it doesn't: the gateway, its secret and its records from everything run in a
-terminal (real), and the terminals from the owner's account (real). People sharing `workstation` can
-still see and change each other's work in it, including each other's tab tokens: separation between
-them is by policy only. Their shells' terminal device belongs to `_sshweb`, so the rare program that
-reopens its terminal by name (rather than `/dev/tty`) can't; ssh, git, editors and agents don't.
+terminal (real), and the terminals from the owner's account (real). Between the people sharing
+`workstation`, much is still shared, and separation there is by policy only:
+
+- the projects: anyone can change anyone's code, including a repository's own agent set-up that runs when
+  someone else works in it (`.claude/settings.json` hooks, `.claude/commands`, `.mcp.json`, `CLAUDE.md`,
+  git hooks, package scripts);
+- `~/.claude.json`, which Claude must be able to write. It also holds per-project MCP servers, which are
+  commands Claude starts;
+- what the tools keep: everyone's Claude conversations (`~/.claude/projects`) and shell history
+  (`~/.zsh_history`);
+- other tools installed in the home (nvm, npm's global folder, `~/.cargo/bin`, …): anyone can replace
+  them. Install shared tools outside it (Homebrew owned by an administrator), or add their folders to the
+  profile;
+- command lines and environments: `pgrep -fl` lists everyone's commands (an agent's prompt included), and
+  a program can read another process's environment, tab tokens and report tokens included. macOS doesn't
+  let a sandbox stop that.
+
+Real separation between people needs an account each. Their shells' terminal device belongs to `_sshweb`,
+so the rare program that reopens its terminal by name (rather than `/dev/tty`) can't; ssh, git, editors and
+agents don't.
