@@ -184,6 +184,8 @@ real PTY, running as the user who runs sshweb. Users can choose any shell listed
 
 - Output is streamed as raw bytes, so colours, cursor movement, alternate screen (vim, less, top) and
   mouse modes work. Keyboard input, including Ctrl+C/D/Z, goes to the PTY, and resizes are applied with `TIOCSWINSZ`.
+- **Copying:** drag to select. While a program uses the mouse (Claude Code, vim, less, tmux), hold ⌥ Option
+  (Shift on Windows and Linux) while you drag. ⌘C or a right-click on the selection copies it.
 - When the shell exits the session closes and its exit code is shown. On close, disconnect timeout,
   idle timeout or shutdown, the whole process group gets SIGHUP and then SIGKILL.
 - **Reconnects:** if the network drops, the page reconnects automatically with backoff and replays

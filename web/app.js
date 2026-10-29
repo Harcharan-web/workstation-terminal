@@ -81,6 +81,15 @@
     }
     return data;
   }
+  const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || "");
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast("Copied", "ok");
+    } catch (_) {
+      toast("Couldn't copy here; press " + (IS_MAC ? "⌘C" : "Ctrl+Insert") + " instead", "error");
+    }
+  }
   function shellQuote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
   function newId() {
     const a = new Uint8Array(9);
@@ -134,11 +143,23 @@
         fontSize: prefs.fontSize,
         scrollback: 5000,
         macOptionIsMeta: !!prefs.optionMeta,
+        // ⌥ Option+drag (Shift+drag elsewhere) selects text even while a program that uses the
+        // mouse (Claude Code, vim, less, tmux) is running.
+        macOptionClickForcesSelection: true,
+        rightClickSelectsWord: false,
         theme: THEMES[prefs.theme],
       });
       this.fitAddon = new window.FitAddon.FitAddon();
       this.term.loadAddon(this.fitAddon);
       this.term.open(this.el);
+      // Right-click on a selection copies it. Caught before xterm sees the click, so the selection
+      // stays as it is; without a selection the browser's own menu (Paste) shows as usual.
+      this.el.addEventListener("contextmenu", (e) => {
+        if (!this.term.hasSelection()) return;
+        e.preventDefault();
+        e.stopPropagation();
+        copyText(this.term.getSelection());
+      }, true);
       // Keystrokes are only sent while bound to a live session; anything typed while
       // disconnected is dropped, never queued, so nothing is replayed after a reconnect.
       this.term.onData((data) => { if (this.live) this.send({ type: "input", data }); });
@@ -864,6 +885,8 @@
   $("set-theme").value = prefs.theme;
   $("set-font").value = prefs.fontSize;
   $("set-meta").checked = !!prefs.optionMeta;
+  if (!IS_MAC) $("select-hint").textContent = $("select-hint").textContent.replace("⌥ Option", "Shift");
+  $("select-hint").title = $("select-hint").textContent;
   document.documentElement.setAttribute("data-theme", prefs.theme);
   try {
     // A link from OpsAPI can name the user (?user=…), so people only pick their key file.
