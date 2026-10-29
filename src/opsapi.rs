@@ -344,6 +344,9 @@ struct KeyEntry {
     expires_unix: u64,
     #[serde(default)]
     email: Option<String>,
+    /// The person's name (newer OpsAPI); one line, at most 120 characters.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// Check OpsAPI's answer and turn it into keys: it must be signed with the shared secret
@@ -378,6 +381,14 @@ pub fn parse_keys_answer(
             continue;
         };
         let email = e.email.map(|m| m.to_ascii_lowercase());
+        // Only shown to the person's shells, so a bad one is left out rather than the key.
+        let name = e.name.as_deref().and_then(|n| {
+            let n = one_line(n, 120);
+            if n.is_none() {
+                warn!(user = %e.user, "opsapi key list: a name isn't valid; left out");
+            }
+            n.filter(|n| !n.is_empty())
+        });
         let key = match PublicKey::from_openssh(&e.public_key) {
             Ok(k) if check_key_strength(k.key_data(), min_rsa_bits).is_ok() => k,
             _ => {
@@ -404,6 +415,7 @@ pub fn parse_keys_answer(
             fingerprint,
             line: 0,
             email,
+            name,
             expires_unix: Some(e.expires_unix),
         });
     }
@@ -1175,6 +1187,31 @@ pub mod tests {
         ] {
             assert!(parse_keys_answer(secret, term, body, sig, at, 2048).is_err());
         }
+    }
+
+    #[test]
+    fn opsapi_keys_carry_an_optional_name() {
+        let now = 1_800_000_000;
+        let (body, sig) = keys_answer(
+            now,
+            json!([
+                {"user": "priya", "public_key": ed_line(1), "expires_unix": now + 3600,
+                 "email": "priya@example.com", "name": "  Priya Patel "},
+                {"user": "sam", "public_key": ed_line(2), "expires_unix": now + 3600,
+                 "name": "Sam\nEvil"},
+                {"user": "old", "public_key": ed_line(3), "expires_unix": now + 3600}
+            ]),
+        );
+        let (_, keys) = parse_keys_answer(SECRET, TERM, &body, &sig, now, 2048).unwrap();
+        let names: Vec<_> = keys
+            .iter()
+            .map(|k| (k.user.as_str(), k.name.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            [("priya", Some("Priya Patel")), ("sam", None), ("old", None)],
+            "a bad name is left out, the key kept"
+        );
     }
 
     #[test]

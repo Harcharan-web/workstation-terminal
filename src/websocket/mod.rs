@@ -497,7 +497,7 @@ impl Conn {
                             })
                     }
                 };
-                let (target, spec) = match built {
+                let (target, mut spec) = match built {
                     Ok(x) => x,
                     Err(msg) => {
                         app.audit.log(
@@ -510,6 +510,14 @@ impl Conn {
                         return Flow::Continue;
                     }
                 };
+                if let Target::Local { .. } = &target {
+                    let keys = app.auth.keys.current().ok();
+                    let key = keys
+                        .as_ref()
+                        .and_then(|k| k.by_fingerprint(&login.key_fingerprint));
+                    spec.env
+                        .extend(crate::terminal::identity_env(&login.user, key));
+                }
                 let name = name
                     .and_then(|n| crate::session::normalize_name(&n).ok().flatten())
                     .or_else(|| claimed.as_ref().map(|p| p.launch.tab_name()));

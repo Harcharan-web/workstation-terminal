@@ -201,7 +201,10 @@ named in `local.run_as`. With `run_as`, sshweb (unprivileged, under its own acco
 account through a narrow sudo rule, so what runs in a terminal can't read the gateway's config, secrets,
 TLS key or logs: see [Shells as another account](docs/OPSAPI.md#shells-as-another-account). Signals to
 those shells also go through that rule. On macOS, `local.sandbox_profile` also keeps them to their folder and the
-web: see [Shells locked to their folder](docs/OPSAPI.md#shells-locked-to-their-folder).
+web: see [Shells locked to their folder](docs/OPSAPI.md#shells-locked-to-their-folder). Each local shell gets
+`SSHWEB_USER` (and, for keys issued in OpsAPI, `SSHWEB_USER_EMAIL` and `SSHWEB_USER_NAME`), so the shared
+account's start-up files can credit the person, e.g. in git commits: see
+[Crediting each person](docs/OPSAPI.md#crediting-each-person).
 
 ## OpsAPI task links
 

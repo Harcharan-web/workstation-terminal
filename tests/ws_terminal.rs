@@ -129,6 +129,48 @@ async fn sockets_must_sign_in_in_time_and_few_may_wait_per_address() {
 }
 
 #[tokio::test]
+async fn shells_say_whose_they_are() {
+    use sshweb::auth::keys::{Access, AuthorizedKey, fingerprint};
+    let mut env = env();
+    let srv = env.start().await;
+    let who = r#"printf 'WHO<%s|%s|%s>\n' "$SSHWEB_USER" "$SSHWEB_USER_EMAIL" "$SSHWEB_USER_NAME""#;
+    // A key from the authorised keys file: only the user name is known.
+    let (_c, mut ws) = logged_in_ws(&env).await;
+    ws.open_local().await;
+    ws.input(&format!("{who}\r")).await;
+    ws.expect_output("WHO<alice||>").await;
+
+    // A key from OpsAPI with the person's email and name.
+    let key = new_key();
+    let now = sshweb::opsapi::unix_now();
+    let priya = AuthorizedKey {
+        user: "priya".into(),
+        access: Access {
+            local: true,
+            ..Access::default()
+        },
+        key: key.public_key().clone(),
+        fingerprint: fingerprint(key.public_key()),
+        line: 0,
+        email: Some("priya@example.com".into()),
+        name: Some("Priya Patel".into()),
+        expires_unix: Some(now + 3600),
+    };
+    srv.app.auth.keys.set_synced(vec![priya], now, now).unwrap();
+    let c = env.client();
+    c.login("priya", &key).await;
+    let cookie = c.cookie_header().unwrap();
+    let mut ws = ws_connect(env.cfg.server.port, Some(&env.base()), Some(&cookie))
+        .await
+        .unwrap();
+    ws.hello().await;
+    ws.open_local().await;
+    ws.input(&format!("{who}\r")).await;
+    ws.expect_output("WHO<priya|priya@example.com|Priya Patel>").await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
 async fn hello_is_required_and_versioned() {
     let mut env = env();
     let srv = env.start().await;

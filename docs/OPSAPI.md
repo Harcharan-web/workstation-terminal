@@ -137,6 +137,9 @@ Then:
 - Audit events: `opsapi_key_added`, `opsapi_key_removed` (user and fingerprint), `opsapi_keys_stale`;
   sign-ins as before (`auth_success` with the user and key fingerprint).
 - Auto sign-in (below) finds these people by the email in the list, so they need no `autologin.users` line.
+- Each entry is `{user, public_key, expires_unix, email?, name?}`. `name` (the person's name, one line,
+  ≤ 120 characters) is optional; a bad one is left out and the key still works. Their shells get the email
+  and name (see [Crediting each person](#crediting-each-person)).
 
 ## Auto sign-in for power users
 
@@ -371,6 +374,34 @@ local <key>.pub`. Admin commands talk to the running gateway as its account:
 
 Finally route a public name to it (reverse proxy → `https://<mac>:7682`, see "Behind a reverse proxy"
 in the README) and enter that address in OpsAPI.
+
+### Crediting each person
+
+Everyone's shells run as `workstation`, so git would put that account's one `user.name`/`user.email` on
+every commit. Each local tab's shell also gets who it is for:
+
+| Variable | Value |
+|---|---|
+| `SSHWEB_USER` | The terminal user they signed in as |
+| `SSHWEB_USER_EMAIL` | Their OpsAPI email (keys issued in OpsAPI) |
+| `SSHWEB_USER_NAME` | Their name, when OpsAPI sends it with their key |
+
+sudo keeps them (`SSHWEB_*` in `env_keep`). To credit the person in git, add this to the account's
+`~/.zshenv`, which every zsh reads (`~/.bash_profile` too if people use bash):
+
+```sh
+# Commits made in an sshweb tab are credited to the person signed in there.
+if [ -n "$SSHWEB_USER_EMAIL" ]; then
+  export GIT_AUTHOR_EMAIL="$SSHWEB_USER_EMAIL" GIT_COMMITTER_EMAIL="$SSHWEB_USER_EMAIL"
+fi
+if [ -n "$SSHWEB_USER_NAME" ]; then
+  export GIT_AUTHOR_NAME="$SSHWEB_USER_NAME" GIT_COMMITTER_NAME="$SSHWEB_USER_NAME"
+fi
+```
+
+Without them (a key from `authorized_keys`, or an OpsAPI that sends no name) git uses the global
+identity. This says who was signed in, not proof: anyone can change the variables in their own tab. Pushes
+still go through the account's one GitHub login.
 
 ### Shells locked to their folder
 
