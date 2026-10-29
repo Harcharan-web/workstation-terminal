@@ -313,8 +313,9 @@ async fn challenge_rate_limit() {
 async fn lockout_after_repeated_failures() {
     let mut env = env();
     env.cfg.rate_limit.max_failures = 3;
+    env.cfg.server.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
     let srv = env.start().await;
-    let c = env.client();
+    let c = env.client_via(Some("203.0.113.5"));
     let wrong = new_key();
     for _ in 0..3 {
         let ch: Value = c.challenge(USER).await.json().await.unwrap();
@@ -326,11 +327,16 @@ async fn lockout_after_repeated_failures() {
             .await;
         assert_eq!(r.status(), 401);
     }
-    // Locked out: even the correct key is refused for now.
+    // Locked out: even the correct key is refused from that address for now.
     let r = c.challenge(USER).await;
     assert_eq!(r.status(), 429);
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["error"], "locked_out");
+    // The user name isn't locked: from anywhere else they sign in as usual, so nobody can lock
+    // a named person out by sending bad signatures for them.
+    env.client_via(Some("203.0.113.6"))
+        .login(USER, &env.key)
+        .await;
     srv.shutdown().await;
     assert!(env.audit_log().contains("\"event\":\"auth_lockout\""));
 }

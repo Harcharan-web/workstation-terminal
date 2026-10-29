@@ -87,7 +87,7 @@ limits:
 
 rate_limit:
   challenges_per_minute: 20   # per client IP
-  max_failures: 5             # failed logins per IP or per user within the window...
+  max_failures: 5             # failed logins per IP (user names aren't locked) within the window...
   failure_window_secs: 300
   lockout_secs: 900           # ...trigger a lockout of this length
 

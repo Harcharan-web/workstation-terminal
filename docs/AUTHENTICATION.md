@@ -53,7 +53,7 @@ The server never parses the message back from the client; it verifies against th
 | Bound to the requesting browser/session | HttpOnly binding cookie (HTTP flow) or the socket's binding secret (WebSocket flow) |
 | Domain separation | Namespace `sshweb-auth` and the `sshweb-auth-v1` message prefix |
 | No user enumeration | Unknown users still get a challenge, and failures return a generic error |
-| Brute-force resistance | Per-IP challenge rate limit, plus lockouts per IP and per user |
+| Brute-force resistance | Per-IP challenge rate limit and per-IP lockouts. User names aren't locked: signatures can't be guessed, and anyone could lock a named person out |
 | Audit | `auth_challenge`, `auth_success`, `auth_failure` (with reason), `auth_lockout` |
 
 ## WebSocket variant

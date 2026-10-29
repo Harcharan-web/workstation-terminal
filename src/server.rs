@@ -693,7 +693,7 @@ async fn launch_login(
     }
     app.auth.admit(&ip)?;
     let now = crate::opsapi::unix_now();
-    let (launch, key) = match autologin_key(&app, &req.ticket, &ip, now) {
+    let (launch, key) = match autologin_key(&app, &req.ticket, now) {
         Ok(v) => v,
         Err(f) => {
             let AutologinFailure {
@@ -740,7 +740,7 @@ async fn launch_login(
 }
 
 /// Why `/api/launch/login` refused, with the OpsAPI user from the link and the mapped terminal
-/// user when known (for the audit log and lock-out).
+/// user when known (for the audit log).
 struct AutologinFailure {
     who: Option<crate::opsapi::LoginClaim>,
     user: Option<String>,
@@ -751,7 +751,6 @@ struct AutologinFailure {
 fn autologin_key(
     app: &AppState,
     ticket: &str,
-    ip: &str,
     now: u64,
 ) -> Result<(crate::opsapi::Launch, crate::auth::keys::AuthorizedKey), Box<AutologinFailure>> {
     use crate::opsapi::AutologinError;
@@ -784,9 +783,6 @@ fn autologin_key(
             fail(None, ApiError::new(status, e.code(), e.to_string()))
         })?;
     let user = user.as_str();
-    app.auth
-        .check_lockout(ip, Some(user))
-        .map_err(|e| fail(Some(user), e.into()))?;
     let key = keys
         .for_user(user)
         .find(|k| k.access.local)

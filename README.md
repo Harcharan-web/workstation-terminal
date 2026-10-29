@@ -425,7 +425,7 @@ The manual browser test procedure, including vim, is in [docs/TESTING.md](docs/T
 |---|---|
 | `authentication failed` | Request a **new** challenge (each one is single-use and expires). Sign with `-n sshweb-auth`. Check `sshweb keys list` shows your key's fingerprint (`ssh-keygen -lf key.pub`) for the user name you typed. |
 | `authentication is unavailable` / `/readyz` 503 | `authorized_keys` is missing, has unsafe permissions or a malformed line: run `sshweb config validate`. |
-| `locked out` (HTTP 429) | Too many failures from your IP or for that user. Wait `rate_limit.lockout_secs`, or restart the server. |
+| `locked out` (HTTP 429) | Too many failures from your IP. Wait `rate_limit.lockout_secs`, or restart the server. |
 | `ssh-keygen: unknown option -- Y` | OpenSSH older than 8.1 on the client; upgrade it. |
 | Signing with an agent key | `ssh-keygen -Y sign -n sshweb-auth -f ~/.ssh/key.pub` (the **.pub** file). |
 | Page loads but WebSocket fails / 403 | You're using a host name or port that isn't allowed. Add the exact `https://host:port` to `server.allowed_origins`. |

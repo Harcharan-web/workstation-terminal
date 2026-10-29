@@ -28,7 +28,7 @@
 | T5 | **Cross-protocol reuse** (e.g. tricking a user into a git-signing operation) | The namespace must equal `sshweb-auth`. The message format `sshweb-auth-v1 …` is not a valid git or file signature target. | `ssh_keygen_signature_interoperates` |
 | T6 | **Cross-site WebSocket hijacking / CSRF** | The `Origin` must exactly match an allowed origin (scheme, host and port) for the WebSocket upgrade and for every state-changing `/api` request. Cookies are SameSite=Strict. | `rejects_cross_site_websocket`, `state_changing_requests_require_origin` |
 | T7 | **DNS rebinding** against the loopback listener | The `Host` header must be one of the bind addresses or configured origins; otherwise 421. | `rejects_foreign_host_header` |
-| T8 | **Online guessing / brute force** | Challenge issuance is rate-limited per IP. After N failures in a window, the IP and the user are locked out temporarily. Errors are generic. Unknown users still receive challenges (no user enumeration). | `challenge_rate_limit`, `lockout_after_repeated_failures` |
+| T8 | **Online guessing / brute force** | Challenge issuance is rate-limited per IP. After N failures in a window, the IP is locked out temporarily. User names aren't locked: Ed25519 and the other accepted signatures can't be guessed, and a per-user lock-out would let anyone lock a named person out. Errors are generic. Unknown users still receive challenges (no user enumeration). | `challenge_rate_limit`, `lockout_after_repeated_failures` |
 | T9 | **Token theft** | 256-bit CSPRNG tokens in HttpOnly cookies, stored server-side only as SHA-256. Absolute and idle expiry. Logout, admin revocation and key revocation take effect within seconds. TLS cookies use `Secure` and the `__Host-` prefix. HSTS is sent under TLS. | `tokens_are_not_stored_in_clear`, `logout_and_key_revocation_end_access`, `https_mode_sets_secure_cookies_and_hsts` |
 | T10 | **XSS / UI injection** | Strict CSP (`script-src 'self'`, no inline scripts, `frame-ancestors 'none'`). The UI uses `textContent`, never `innerHTML`, for server data. Terminal output is rendered by xterm.js, not the DOM. | `serves_embedded_frontend_with_security_headers` |
 | T11 | **Resource exhaustion** | Per-message size limit (64 KiB), HTTP body limit, a global WebSocket connection cap, per-connection input token bucket, bounded channels with backpressure end to end, bounded scrollback, session limits total and per user, a cap on outstanding challenges, and protocol-error budgets. | `oversized_message_closes_connection`, `too_many_protocol_errors_close_the_socket`, `session_limit_per_user`, `malformed_and_oversized_requests` |
@@ -74,8 +74,9 @@
 - **Fail-closed authorisation file.** One malformed line rejects all logins and terminates existing
   sessions until fixed. This is deliberate, but it means an editing mistake causes an outage.
   Use `sshweb keys add/revoke` and `sshweb config validate`.
-- **Lockout as DoS.** An attacker can lock out a user name by sending bad signatures for it.
-  Lockouts are temporary (`rate_limit.lockout_secs`).
+- **Lockout as DoS.** Lock-outs are per client IP, so people behind the same address (an office NAT)
+  lock each other out with repeated failures. Behind a proxy, list it in `server.trusted_proxies`, or
+  everyone shares the proxy's address. Lockouts are temporary (`rate_limit.lockout_secs`).
 - **Trust in dependencies.** RustCrypto `ssh-key` (signature verification), `rustls` (TLS),
   OpenSSH (remote transport, host keys), `portable-pty` and xterm.js.
 - **Task text is untrusted input to agents.** Anyone who can edit a task in OpsAPI can steer the agent
