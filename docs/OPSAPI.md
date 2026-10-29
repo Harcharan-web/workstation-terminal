@@ -217,7 +217,7 @@ it keeps the text they give Claude and what their screen shows.
 
 | What | Recorded |
 |---|---|
-| Tab (local and remote) | terminal user and key fingerprint, sign-in (`key` / `opsapi_launch`), IP, the task link if any, folder, agent, opened/closed, how it ended, exit code, active seconds (counted every 10 s when there was input or output in the last 60 s), bytes in/out |
+| Tab (local and remote) | terminal user and key fingerprint, sign-in (`key` / `opsapi_launch`), IP, the task link if any, folder, agent, opened/closed, how it ended, exit code, active seconds (counted every 10 s when there was input or output in the last 60 s), bytes in/out, when the last keystroke came, whether a browser is connected |
 | Claude Code (from its own OpenTelemetry) | each prompt's text (cut to 16 KiB), each model request (model, tokens, cost estimate, duration), tool results and decisions (tool, success, parameters cut to 8 KiB), API errors, lines added/removed, commits, pull requests. Codex, Cursor and plain shells send nothing here. |
 | Screen (local tabs) | the tab's **output**, what the screen shows, as an [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/) recording (`o` and `r` events). **Keystrokes are never recorded**, but what the terminal echoes back is on screen (passwords at a no-echo prompt aren't). |
 
@@ -253,10 +253,16 @@ How it works:
   the `claude_code.{lines_of_code,commit,pull_request}.count` and `claude_code.active_time.total`
   metrics are kept.
 - Every 10 s, when something is new, the gateway sends `POST {url}/activity` (`X-Opsapi-Terminal`,
-  `X-Opsapi-Signature: sha256=<hex HMAC of the body>`): tabs at open, at close and every 60 s while they
-  change, and the new events. While OpsAPI can't be reached they wait in memory (up to 20 000 events,
+  `X-Opsapi-Signature: sha256=<hex HMAC of the body>`): each tab at open, at close and once a minute while
+  it is open, changed or not (a heartbeat: a tab not heard of for a few minutes went away with its
+  gateway), and the new events. While OpsAPI can't be reached they wait in memory (up to 20 000 events,
   oldest dropped first) and are retried with backoff up to 5 minutes. A clean shutdown sends the tabs'
   final state.
+- A tab's state, which OpsAPI upserts by `id`: `id`, `user`, `key`, `via`, `ip`, `launch`, `kind`, `cwd`,
+  `agent`, `opened_at`, `closed_at`, `end_reason`, `exit_code`, `active_secs`, `input_bytes`,
+  `output_bytes`, and from this version `last_input_at` (unix seconds of the tab's last keystroke or
+  paste; `null` before the first) and `attached` (a browser is connected to the tab now; `false` once
+  closed). Older gateways send neither, and later ones may add fields: ignore what you don't know.
 - A recording part closes every 60 s or 1 MiB and when its tab ends, is gzipped to
   `<state_dir>/recordings/<tab>-<part>.cast.gz` (0600), sent as `POST {url}/recordings`
   (`X-Opsapi-Tab`, `X-Opsapi-Part`, `X-Opsapi-Final`, signature over `"<tab>\n<part>\n"` + body) and
