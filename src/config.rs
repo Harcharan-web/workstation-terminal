@@ -146,8 +146,9 @@ pub struct AgentConfig {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
-    /// Shell command line run in the task folder, e.g. `claude "$OPSAPI_TASK_PROMPT"`.
-    /// The task text is only available through the OPSAPI_* environment variables.
+    /// Shell command line run in the task folder, e.g. `claude -- "$OPSAPI_TASK_PROMPT"` (`--` so
+    /// the prompt is never read as an option). The task text is only available through the
+    /// OPSAPI_* environment variables.
     pub run: String,
 }
 

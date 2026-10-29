@@ -29,12 +29,13 @@ turned on [auto sign-in](#auto-sign-in-for-power-users) for that person.
      webhook_url: https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal/webhook
      webhook_secret: "<from OpsAPI>"      # or SSHWEB_OPSAPI_WEBHOOK_SECRET
      agents:                              # ids must match the agents listed in OpsAPI
-       - { id: claude, name: Claude Code, run: 'claude "$OPSAPI_TASK_PROMPT"' }
-       - { id: codex,  name: Codex,       run: 'codex "$OPSAPI_TASK_PROMPT"' }
-       - { id: cursor, name: Cursor,      run: 'cursor-agent "$OPSAPI_TASK_PROMPT"' }
+       # `--` before the prompt, so a prompt starting with `-` is never read as an option.
+       - { id: claude, name: Claude Code, run: 'claude -- "$OPSAPI_TASK_PROMPT"' }
+       - { id: codex,  name: Codex,       run: 'codex -- "$OPSAPI_TASK_PROMPT"' }
+       - { id: cursor, name: Cursor,      run: 'cursor-agent -- "$OPSAPI_TASK_PROMPT"' }
        # Never stops to ask. Only acceptable because this gateway runs under its own macOS
        # account (below); leave it out to forbid unattended agents.
-       - { id: claude_auto, name: "Claude Code (unattended)", run: 'claude --dangerously-skip-permissions "$OPSAPI_TASK_PROMPT"' }
+       - { id: claude_auto, name: "Claude Code (unattended)", run: 'claude --dangerously-skip-permissions -- "$OPSAPI_TASK_PROMPT"' }
      idle_timeout_secs: 14400             # task tabs: 4 h with neither input nor output
      detach_grace_secs: 14400             # task tabs keep running 4 h after the browser closes
    ```
@@ -53,7 +54,9 @@ environment variables, so its text is never parsed as shell syntax:
 | `OPSAPI_TASK`, `OPSAPI_LAUNCH` | Task id and launch id |
 | `OPSAPI_REPORT_URL`, `OPSAPI_REPORT_TOKEN` | Where and how the agent tells OpsAPI about its pull request (only when the link has `report`) |
 
-Always quote it (`"$OPSAPI_TASK_PROMPT"`).
+Always quote it and put `--` before it (`claude -- "$OPSAPI_TASK_PROMPT"`), so a prompt that starts with
+`-` (say `--settings=…`) is never read as an option. The gateway also refuses such a prompt
+(`prompt_starts_with_dash`), for run lines written without the `--`.
 
 ## What happens
 
@@ -66,8 +69,9 @@ Always quote it (`"$OPSAPI_TASK_PROMPT"`).
    - resolves the folder with `realpath` and requires an existing directory inside `local.allowed_roots`
      (symlinks can't escape);
    - looks the agent id up in `opsapi.agents`.
-   Errors: `invalid_link`, `expired`, `not_configured`, `folder_not_found`, `folder_not_allowed`,
-   `unknown_agent` (400), `forbidden` (403), `already_used` (409, another user accepted it).
+   Errors: `invalid_link`, `expired`, `not_configured`, `prompt_starts_with_dash` (the prompt's first
+   non-blank character is `-`), `folder_not_found`, `folder_not_allowed`, `unknown_agent` (400),
+   `forbidden` (403), `already_used` (409, another user accepted it).
 3. The page opens a tab with `{"type":"open","target":{"kind":"local"},"launch":"<id>"}`. The folder,
    agent and environment come only from the accepted launch. The launch is then used up: re-posting the
    link returns the running session (a page reload re-attaches it); opening it again is refused.
@@ -184,7 +188,7 @@ Errors (`{"error": "<code>", "message": "…"}`):
 | Status | `error` | When |
 |---|---|---|
 | 400 | `invalid_link` | bad signature or fields, lifetime over 120 s, or `stepup` later than `iat` |
-| 400 | `expired`, `not_configured` | as for `/api/launch` |
+| 400 | `expired`, `not_configured`, `prompt_starts_with_dash` | as for `/api/launch` |
 | 403 | `autologin_off` | `opsapi.autologin.enabled` is false (or local terminals are off); not counted towards lock-out |
 | 403 | `autologin_not_allowed` | the link has no `login`, the email isn't mapped, or the mapped user has no key allowing `local` |
 | 403 | `stepup_stale` | the step-up is older than `max_stepup_age_secs` |

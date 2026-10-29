@@ -156,6 +156,11 @@ pub enum LinkError {
     Expired,
     #[error("task links aren't set up on this terminal")]
     NotConfigured,
+    #[error(
+        "this task's text starts with \"-\", which the agent would take as an option; \
+         change the start of the task text in OpsAPI and open it again"
+    )]
+    PromptIsOption,
 }
 
 /// One line of text: no control characters, at most `max` characters.
@@ -227,6 +232,12 @@ pub fn verify_ticket(secret: &str, ticket: &str, now: u64) -> Result<Launch, Lin
     if let Some(r) = &c.report {
         bad(valid_url(&r.url, 512) && valid_report_token(&r.token))?;
     }
+    // Agents get the prompt as an argument. The documented run lines put `--` before it, but a
+    // line without one would read a prompt like `--settings=…` as an option.
+    let prompt = clean_prompt(&c.prompt);
+    if prompt.trim_start().starts_with('-') {
+        return Err(LinkError::PromptIsOption);
+    }
     Ok(Launch {
         id: c.id.to_ascii_lowercase(),
         task: c.task.to_ascii_lowercase(),
@@ -234,7 +245,7 @@ pub fn verify_ticket(secret: &str, ticket: &str, now: u64) -> Result<Launch, Lin
         title,
         path: c.path,
         agent: c.agent,
-        prompt: clean_prompt(&c.prompt),
+        prompt,
         by,
         return_url: c.return_url,
         workspace,
@@ -279,6 +290,7 @@ impl LinkError {
             LinkError::Expired => "expired",
             LinkError::NotConfigured => "not_configured",
             LinkError::Invalid => "invalid_link",
+            LinkError::PromptIsOption => "prompt_starts_with_dash",
         }
     }
 }
@@ -807,6 +819,23 @@ pub mod tests {
                 Err(LinkError::Invalid),
                 "{k}"
             );
+        }
+    }
+
+    #[test]
+    fn prompts_that_start_with_a_dash_are_refused() {
+        let now = 1_800_000_000;
+        let with = |p: &str| {
+            let mut c = claims(now, "/srv/x");
+            c["prompt"] = json!(p);
+            verify_ticket(SECRET, &mint(SECRET, c), now)
+        };
+        for p in ["-p", "--settings=/tmp/evil.json", "  \n\t--model x", "\u{1b}-x"] {
+            assert_eq!(with(p), Err(LinkError::PromptIsOption), "{p:?}");
+        }
+        assert_eq!(with("-p").unwrap_err().code(), "prompt_starts_with_dash");
+        for p in ["", "Fix the --verbose flag", "— a dash of style", "x -y"] {
+            assert!(with(p).is_ok(), "{p:?}");
         }
     }
 
