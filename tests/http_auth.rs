@@ -342,6 +342,34 @@ async fn lockout_after_repeated_failures() {
 }
 
 #[tokio::test]
+async fn background_polls_do_not_keep_a_login_alive() {
+    let mut env = env();
+    env.cfg.auth.session_idle_timeout_secs = 2;
+    let srv = env.start().await;
+    let (left_open, in_use) = (env.client(), env.client());
+    left_open.login(USER, &env.key).await;
+    in_use.login(USER, &env.key).await;
+    let sessions = |c: &Client, poll: bool| {
+        let mut r = c.http.get(c.url("/api/sessions"));
+        if poll {
+            r = r.header("x-sshweb-poll", "1");
+        }
+        async move { r.send().await.unwrap().status().as_u16() }
+    };
+    let (mut polled, mut used) = (Vec::new(), Vec::new());
+    for _ in 0..6 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        polled.push(sessions(&left_open, true).await);
+        used.push(sessions(&in_use, false).await);
+    }
+    // A page that only polls goes idle; one that is used stays signed in.
+    assert_eq!(polled.first(), Some(&200), "{polled:?}");
+    assert_eq!(polled.last(), Some(&401), "{polled:?}");
+    assert!(used.iter().all(|s| *s == 200), "{used:?}");
+    srv.shutdown().await;
+}
+
+#[tokio::test]
 async fn logout_and_key_revocation_end_access() {
     let mut env = env();
     let srv = env.start().await;

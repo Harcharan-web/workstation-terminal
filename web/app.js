@@ -64,8 +64,8 @@
     $("btn-terminal-view").classList.toggle("hidden", view !== "settings");
     if (view === "term" && active) setTimeout(() => active.fit(), 0);
   }
-  async function api(method, path, body) {
-    const opts = { method, credentials: "same-origin", headers: {} };
+  async function api(method, path, body, headers) {
+    const opts = { method, credentials: "same-origin", headers: Object.assign({}, headers) };
     if (body !== undefined) {
       opts.headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(body);
@@ -548,10 +548,13 @@
   }
 
   // ---------- session list ----------
-  async function refreshSessions() {
+  // `background`: the timer's refresh, which the server doesn't count as activity, so a page left
+  // open still lets the login go idle. Typing in a terminal counts.
+  async function refreshSessions(background) {
     if (!me) return;
     let data;
-    try { data = await api("GET", "/api/sessions"); } catch (e) {
+    const poll = background === true ? { "X-Sshweb-Poll": "1" } : undefined;
+    try { data = await api("GET", "/api/sessions", undefined, poll); } catch (e) {
       if (e.status === 401) toLogin("Please sign in.");
       return;
     }
@@ -671,7 +674,7 @@
   }
   $("btn-connect").addEventListener("click", openNewTab);
   $("btn-newtab").addEventListener("click", openNewTab);
-  $("btn-refresh").addEventListener("click", refreshSessions);
+  $("btn-refresh").addEventListener("click", () => refreshSessions());
   $("btn-rename").addEventListener("click", () => { if (active) renameTab(active); });
   $("term-title").addEventListener("dblclick", () => { if (active) renameTab(active); });
   $("btn-clear").addEventListener("click", () => { if (active) { active.term.clear(); active.term.focus(); } });
@@ -898,6 +901,6 @@
   window.addEventListener("online", () => {
     for (const t of tabs) if (t.started && !t.ws && t.sessionId) t.reconnect();
   });
-  setInterval(() => { if (me) refreshSessions(); }, 15000);
+  setInterval(() => { if (me) refreshSessions(true); }, 15000);
   enter();
 })();

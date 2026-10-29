@@ -233,12 +233,19 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The page's own background polls send `X-Sshweb-Poll: 1`. They don't count as activity, so a
+/// page left open doesn't keep its login from going idle.
+pub const POLL_HEADER: &str = "x-sshweb-poll";
+
 fn require_login(app: &AppState, headers: &HeaderMap) -> Result<(String, Login), ApiError> {
     let tok = session_token_from_headers(app, headers).ok_or_else(ApiError::unauthenticated)?;
-    let login = app
-        .auth
-        .validate(&tok)
-        .ok_or_else(ApiError::unauthenticated)?;
+    let poll = headers.get(POLL_HEADER).is_some_and(|v| v.as_bytes() == b"1");
+    let login = if poll {
+        app.auth.validate_quietly(&tok)
+    } else {
+        app.auth.validate(&tok)
+    };
+    let login = login.ok_or_else(ApiError::unauthenticated)?;
     Ok((tok, login))
 }
 

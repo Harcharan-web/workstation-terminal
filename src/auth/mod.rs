@@ -245,7 +245,13 @@ impl AuthService {
     /// Like [`validate`](Self::validate) but without refreshing the idle timer; used for
     /// periodic background checks so an idle open tab does not keep a login alive.
     pub fn check_still_valid(&self, token: &str) -> bool {
-        self.validate_with(token, false).is_some()
+        self.validate_quietly(token).is_some()
+    }
+
+    /// [`validate`](Self::validate) for a background poll: the login, without counting the
+    /// request as activity.
+    pub fn validate_quietly(&self, token: &str) -> Option<Login> {
+        self.validate_with(token, false)
     }
 
     fn validate_with(&self, token: &str, touch: bool) -> Option<Login> {

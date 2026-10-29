@@ -98,7 +98,9 @@ gateway on loopback or a VPN and the short challenge lifetime limit exposure.
 
 Resuming never bypasses key authentication:
 
-- A browser login is a cookie with an 8 h absolute and 30 min idle lifetime. While it's valid, reopening
+- A browser login is a cookie with an 8 h absolute and 30 min idle lifetime. Typing in a terminal and using
+  the page count as activity; the page's own background refresh of the session list (`X-Sshweb-Poll: 1`)
+  and terminal output don't, so a page left open still goes idle. While it's valid, reopening
   the page restores your tabs without a new signature.
 - Once it has expired, you sign a new challenge exactly as above. There is no long-lived "remember me"
   token, and saved tabs and detached shells are only reachable through a fresh login.

@@ -97,7 +97,7 @@ keystrokes typed while disconnected. Attaching from a second window takes over t
 | `POST /api/auth/verify` `{challenge_id, signature}` | Origin + binding cookie | Log in; sets the session cookie |
 | `POST /api/auth/logout` | Origin | Revoke the login and close its sessions |
 | `GET /api/me` | cookie | Identity, access, permitted profiles and shells |
-| `GET /api/sessions` | cookie | Your sessions and their state |
+| `GET /api/sessions` | cookie | Your sessions and their state. With `X-Sshweb-Poll: 1` (the page's background refresh) the request doesn't count as activity for the login's idle timeout |
 | `GET /api/workspace` | cookie | Your saved tabs: `{tabs:[{id, target, name, session_id}], active}` |
 | `PUT /api/workspace` | cookie + Origin | Save tabs (≤ 16, validated; last writer wins). Local tabs may carry `cwd`. |
 | `POST /api/launch` `{ticket}` | cookie + Origin | Accept an OpsAPI task link: `{launch, name, cwd, agent:{id,name}, task:{uuid,number,title,url}, by, workspace, used, session_id}`. See [OPSAPI.md](OPSAPI.md). |
