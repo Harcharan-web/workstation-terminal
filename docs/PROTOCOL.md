@@ -1,7 +1,9 @@
 # WebSocket protocol, version 1
 
 Endpoint: `GET /ws` (WSS under TLS). The upgrade requires an allowed `Origin` and `Host`
-(403/421 otherwise). A valid login cookie, if present, authenticates the socket.
+(403/421 otherwise). A valid login cookie, if present, authenticates the socket. Without one, at most
+`limits.max_unauthenticated_websockets_per_ip` (8) sockets per client IP may wait to sign in (429 beyond
+that), and each must sign in within `limits.ws_auth_timeout_secs` (30 s) of connecting.
 
 ## Framing
 
@@ -21,7 +23,8 @@ Endpoint: `GET /ws` (WSS under TLS). The upgrade requires an allowed `Origin` an
 ```
 connected ──hello(v=1)──▶ greeted ──(cookie or auth_ok)──▶ authenticated ──open/attach──▶ bound
     │ (10 s without hello: closed)        │ any terminal message before auth:              │ session_closed / detach / status:detached
-    └─ any other message: fatal error     └─ fatal "unauthenticated", socket closed        └──▶ authenticated
+    └─ any other message: fatal error     │   fatal "unauthenticated", socket closed       └──▶ authenticated
+                                          └ not authenticated 30 s after connecting: fatal "auth_timeout"
 ```
 
 Each socket is bound to **one** authenticated identity and at most **one** terminal session at a time.
@@ -56,8 +59,8 @@ The login is re-validated (expiry, revocation, key still authorised) on every te
 | `pong` | `ts` |
 | `error` | `code`, `message`, `fatal`. Fatal errors are followed by a close. |
 
-Error codes: `bad_message`, `hello_required`, `hello_timeout`, `unsupported_version`, `unauthenticated`,
-`session_expired`, `forbidden`, `open_failed`, `no_such_session`, `no_session`, `session_closed`,
+Error codes: `bad_message`, `hello_required`, `hello_timeout`, `auth_timeout`, `unsupported_version`,
+`unauthenticated`, `session_expired`, `forbidden`, `open_failed`, `no_such_session`, `no_session`, `session_closed`,
 `resize_failed`, `server_shutdown`.
 
 ## Reconnect semantics

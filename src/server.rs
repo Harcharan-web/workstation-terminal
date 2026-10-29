@@ -39,6 +39,8 @@ pub struct AppState {
     pub origin: OriginPolicy,
     pub shutdown: CancellationToken,
     pub ws_slots: Arc<Semaphore>,
+    /// WebSockets not signed in yet, per client IP (`limits.max_unauthenticated_websockets_per_ip`).
+    pub ws_unauthenticated: crate::security::rate_limit::PerKeyCap,
     pub workspaces: crate::workspace::WorkspaceStore,
     /// OpsAPI task links accepted by `POST /api/launch`.
     pub launches: crate::opsapi::LaunchStore,
@@ -57,6 +59,9 @@ impl AppState {
             sessions: SessionManager::new(cfg.clone(), audit.clone(), metrics.clone()),
             origin: OriginPolicy::from_config(&cfg),
             ws_slots: Arc::new(Semaphore::new(cfg.limits.max_websockets)),
+            ws_unauthenticated: crate::security::rate_limit::PerKeyCap::new(
+                cfg.limits.max_unauthenticated_websockets_per_ip,
+            ),
             workspaces: crate::workspace::WorkspaceStore::new(
                 cfg.server.state_dir.join("workspaces"),
             ),

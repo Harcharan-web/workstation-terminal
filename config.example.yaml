@@ -81,6 +81,8 @@ sessions:
 limits:
   ws_max_message_bytes: 65536
   max_websockets: 64
+  ws_auth_timeout_secs: 30                 # a socket not signed in this long after connecting is closed
+  max_unauthenticated_websockets_per_ip: 8 # sockets not signed in yet, per client IP
   input_bytes_per_sec: 262144
   input_burst_bytes: 1048576
   max_http_body_bytes: 32768
