@@ -152,13 +152,23 @@
       this.fitAddon = new window.FitAddon.FitAddon();
       this.term.loadAddon(this.fitAddon);
       this.term.open(this.el);
-      // Right-click on a selection copies it. Caught before xterm sees the click, so the selection
-      // stays as it is; without a selection the browser's own menu (Paste) shows as usual.
-      this.el.addEventListener("contextmenu", (e) => {
-        if (!this.term.hasSelection()) return;
+      // Right-click on a selection copies it. Caught on the press, before xterm sees it: in a program
+      // that uses the mouse xterm would send the press to the program and clear the selection. Without
+      // a selection the browser's own menu (Paste) shows as usual.
+      let copiedOnPress = false;
+      this.el.addEventListener("mousedown", (e) => {
+        copiedOnPress = e.button === 2 && this.term.hasSelection();
+        if (!copiedOnPress) return;
         e.preventDefault();
         e.stopPropagation();
         copyText(this.term.getSelection());
+      }, true);
+      this.el.addEventListener("contextmenu", (e) => {
+        if (!copiedOnPress && !this.term.hasSelection()) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (!copiedOnPress) copyText(this.term.getSelection());
+        copiedOnPress = false;
       }, true);
       // Keystrokes are only sent while bound to a live session; anything typed while
       // disconnected is dropped, never queued, so nothing is replayed after a reconnect.
